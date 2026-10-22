@@ -39,6 +39,7 @@ try{
   await page.locator('dialog').getByRole('button',{name:'取消',exact:true}).click();await page.locator('dialog').getByRole('button',{name:'关闭',exact:true}).click();
   step('machine detail and stop confirmation');
   await page.getByRole('button',{name:'设置 development 保活',exact:true}).click();
+  assert.equal(await page.getByText(/AUTOMATION_SECRET/).count(),0);
   assert.equal(await page.locator('input[name="keepalive-mode"][value="off"]').isChecked(),true);
   await page.locator('input[name="keepalive-mode"][value="always"]').check();await page.getByRole('button',{name:'保存保活设置',exact:true}).click();
   await dev.locator('.keepalive-button.enabled').waitFor();assert.equal(await dev.locator('.keepalive-button.enabled').count(),1);
@@ -52,6 +53,7 @@ try{
   await page.locator('input[name="keepalive-mode"][value="off"]').check();await page.getByRole('button',{name:'保存保活设置',exact:true}).click();
   step('keepalive defaults off, persists all-day and five daily windows, and can be disabled');
   await page.getByRole('button',{name:'Telegram 设置',exact:true}).click();await page.getByLabel('私人聊天 ID',{exact:true}).waitFor();
+  assert.equal(await page.getByText(/AUTOMATION_SECRET/).count(),0);
   assert.equal(await page.getByRole('checkbox',{name:/机器离线时通知我/}).isChecked(),false);
   await page.getByLabel('Bot Token',{exact:true}).fill('123456789:demo_token_not_sent_to_telegram');await page.getByLabel('私人聊天 ID',{exact:true}).fill('12345678');
   await page.getByRole('button',{name:'绑定机器人',exact:true}).click();await page.getByText(/已绑定 @instabox_demo_bot/).waitFor();

@@ -1,4 +1,4 @@
-import { automationDataKey, hasAutomationSecret, type AutomationEnv } from './automation';
+import { automationDataKey, type AutomationEnv } from './automation';
 import { checkKeepalive } from './keepalive';
 import { checkTelegramNotifications } from './telegram';
 import { database, ensureDatabase } from './schema';
@@ -6,7 +6,7 @@ import { PanelError } from './errors';
 import type { Fetcher } from './instabox';
 
 export async function runAutomation(env: AutomationEnv, scheduledTime = Date.now(), fetcher: Fetcher = (input, init) => fetch(input, init)): Promise<void> {
-  if (!env.DB || !hasAutomationSecret(env)) return;
+  if (!env.DB) return;
   const db = database(env);
   await ensureDatabase(db);
   if (!await db.prepare('SELECT id FROM insb_automation WHERE id=1').first()) return;

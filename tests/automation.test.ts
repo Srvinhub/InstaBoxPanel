@@ -4,8 +4,8 @@ import { Miniflare, convertV4MiniflareOptions } from 'miniflare';
 import { build } from 'esbuild';
 import { createApp, type Env } from '../src/worker/app';
 import { ensureDatabase } from '../src/worker/schema';
-import { encryptKey } from '../src/worker/crypto';
-import { enableAutomation } from '../src/worker/automation';
+import { encryptKey, decryptKey } from '../src/worker/crypto';
+import { automationDataKey, enableAutomation } from '../src/worker/automation';
 import { createAction } from '../src/worker/actions';
 import { runAutomation } from '../src/worker/scheduler';
 import { checkTelegramNotifications } from '../src/worker/telegram';
@@ -89,7 +89,7 @@ async function fixture() {
     return Response.json(current);
   };
   const app = createApp({ fetcher, authenticate: async () => ({ username: 'owner', key: dataKey }) });
-  const env = { DB: db, AUTOMATION_SECRET: automationSecret } as Env;
+  const env = { DB: db } as Env;
   async function call(path: string, method = 'GET', body?: unknown, extraHeaders = {}) {
     const response = await app.fetch(new Request(base + path, { method, headers: { ...headers, ...extraHeaders }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) }), env);
     return { status: response.status, body: await response.json() as any };
@@ -101,6 +101,17 @@ async function fixture() {
     app.fetch(new Request(base + '/api/telegram/webhook', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Telegram-Bot-Api-Secret-Token': secret },
       body: JSON.stringify({ update_id: updateId, message: { date: Math.floor(Date.now() / 1000), chat: { id: Number(chatId), type: 'private' }, from: { id: Number(chatId) }, text, ...extra } }) }), env);
   return { runtime, db, env, calls, messages, telegramCalls, operations, control, machines, fetcher, call, run, setPolicy, webhook };
+}
+
+async function writeLegacyCredentials(db: D1Database) {
+  const encryptedData = await encryptKey(dataKey, automationSecret, 'automation:1');
+  const encryptedToken = await encryptKey(botToken, automationSecret, 'telegram:1');
+  await db.batch([
+    db.prepare('INSERT INTO insb_automation (id,key_ciphertext,key_iv) VALUES (1,?,?) ON CONFLICT(id) DO UPDATE SET key_ciphertext=excluded.key_ciphertext,key_iv=excluded.key_iv')
+      .bind(encryptedData.ciphertext, encryptedData.iv),
+    db.prepare('UPDATE insb_telegram SET token_ciphertext=?,token_iv=? WHERE id=1').bind(encryptedToken.ciphertext, encryptedToken.iv),
+    db.prepare('DELETE FROM insb_automation_keys'),
+  ]);
 }
 
 test('daily keepalive windows validate five ranges, overlaps, midnight boundaries and local time zones', () => {
@@ -117,22 +128,26 @@ test('daily keepalive windows validate five ranges, overlaps, midnight boundarie
   assert.throws(() => validateSchedule({ mode: ['always'] }));
 });
 
-test('keepalive runs with real D1, protected automation keys, state checks and durable request deduplication', async context => {
+test('keepalive runs with only D1, automatically managed keys, state checks and durable request deduplication', async context => {
   const fixtureState = await fixture();
   const { db, env, machines, calls, operations, control, call, setPolicy, run } = fixtureState;
   try {
-    await context.test('configuration requires a separate secret and never exposes automation credentials', async () => {
-      delete env.AUTOMATION_SECRET;
-      assert.equal((await setPolicy('machine-0')).status, 503);
+    await context.test('configuration needs only DB, allows the database owner to recover credentials and never exposes them through APIs', async () => {
+      assert.equal(env.AUTOMATION_SECRET, undefined);
       assert.equal((await setPolicy('machine-0', 'off')).status, 200);
-      env.AUTOMATION_SECRET = automationSecret;
       const result = await setPolicy('machine-0');
       assert.equal(result.status, 200); assert.equal(result.body.policies[0].mode, 'always');
       const persisted = JSON.stringify(await db.prepare('SELECT * FROM insb_automation').all());
+      const keys = await db.prepare('SELECT wrapping_key FROM insb_automation_keys WHERE id=1').first<{ wrapping_key: string }>();
+      assert.equal(Buffer.from(keys!.wrapping_key, 'base64').length, 32);
+      const stored = await db.prepare('SELECT key_ciphertext,key_iv FROM insb_automation WHERE id=1').first<any>();
+      assert.equal(await decryptKey(stored.key_ciphertext.slice(3), stored.key_iv, keys!.wrapping_key, 'automation:1'), dataKey);
+      assert.equal(await automationDataKey(env), dataKey);
       for (const sensitive of [dataKey, automationSecret, 'ibk_fixture_account']) {
         assert.equal(persisted.includes(sensitive), false);
         assert.equal(JSON.stringify(result.body).includes(sensitive), false);
       }
+      assert.equal(JSON.stringify(result.body).includes(keys!.wrapping_key), false);
       assert.equal((await call('/api/accounts/account-a/machines/machine-0/keepalive', 'PUT', { mode: 'always' }, { Origin: 'https://evil.test' })).status, 403);
     });
     await context.test('enabling policies concurrently cannot exceed five machines', async () => {
@@ -316,7 +331,7 @@ test('automation budgets and cross-channel races do not prevent keepalive or dup
       assert.equal(actions.results.length, 1);
     } finally { await fixtureState.runtime.dispose(); }
   });
-  await context.test('a stale encrypted bot token does not disable keepalive after automation key recovery', async () => {
+  await context.test('changing or removing the old environment secret does not affect DB-managed keepalive or Telegram', async () => {
     const fixtureState = await fixture();
     const { env, call, setPolicy, machines, operations, run } = fixtureState;
     try {
@@ -324,7 +339,9 @@ test('automation budgets and cross-channel races do not prevent keepalive or dup
       env.AUTOMATION_SECRET = Buffer.alloc(32, 19).toString('base64');
       await setPolicy('machine-0'); machines.get('machine-0')!.state = 'suspended';
       await run(); assert.equal(operations.size, 1);
-      assert.ok((await call('/api/telegram')).body.lastError.includes('解除绑定'));
+      assert.equal((await call('/api/telegram')).body.lastError, '');
+      delete env.AUTOMATION_SECRET;
+      await run(); assert.equal((await call('/api/telegram')).body.tokenRequired, false);
     } finally { await fixtureState.runtime.dispose(); }
   });
   await context.test('account deletion cannot erase credentials when a machine action arrives after its initial pending check', async () => {
@@ -430,6 +447,116 @@ test('Telegram settings preserve offline deduplication and fail closed if webhoo
   });
 });
 
+test('database-managed automation keys initialize concurrently and upgrade existing personal deployments', async context => {
+  await context.test('an upgraded database adds the new key table without clearing policies, tokens or other application data', async () => {
+    const fixtureState = await fixture();
+    const { db, env, call, setPolicy } = fixtureState;
+    try {
+      await call('/api/telegram', 'PUT', { botToken, chatId, notifyOffline: false });
+      await setPolicy('machine-0');
+      await writeLegacyCredentials(db);
+      await db.prepare('DROP TABLE insb_automation_keys').run();
+      await db.prepare("DELETE FROM insb_d1_migrations WHERE name='0005_automation_keys.sql'").run();
+      await db.prepare('CREATE TABLE other_app_state (id INTEGER PRIMARY KEY,payload TEXT)').run();
+      await db.prepare("INSERT INTO other_app_state VALUES (1,'unchanged')").run();
+      const policy = await db.prepare("SELECT mode,version FROM insb_keepalive WHERE machine_id='machine-0'").first();
+      const authorization = await db.prepare('SELECT webhook_hash,chat_id FROM insb_telegram WHERE id=1').first();
+      env.AUTOMATION_SECRET = automationSecret;
+      assert.equal((await call('/api/keepalive')).status, 200);
+      assert.equal((await db.prepare("SELECT name FROM insb_d1_migrations WHERE name='0005_automation_keys.sql'").first<any>()).name, '0005_automation_keys.sql');
+      assert.deepEqual(await db.prepare("SELECT mode,version FROM insb_keepalive WHERE machine_id='machine-0'").first(), policy);
+      assert.deepEqual(await db.prepare('SELECT webhook_hash,chat_id FROM insb_telegram WHERE id=1').first(), authorization);
+      assert.deepEqual(await db.prepare('SELECT payload FROM other_app_state WHERE id=1').first(), { payload: 'unchanged' });
+      delete env.AUTOMATION_SECRET;
+      assert.equal(await automationDataKey(env), dataKey);
+      assert.equal((await call('/api/telegram')).body.tokenRequired, false);
+    } finally { await fixtureState.runtime.dispose(); }
+  });
+  await context.test('concurrent initialization creates one stable database key without any environment secret', async () => {
+    const fixtureState = await fixture();
+    const { db, env, call } = fixtureState;
+    try {
+      env.AUTOMATION_SECRET = 'invalid-old-secret';
+      await Promise.all(Array.from({ length: 8 }, () => enableAutomation(env, dataKey)));
+      const stored = await db.prepare('SELECT wrapping_key FROM insb_automation_keys').all<{ wrapping_key: string }>();
+      assert.equal(stored.results.length, 1);
+      assert.equal(Buffer.from(stored.results[0].wrapping_key, 'base64').length, 32);
+      delete env.AUTOMATION_SECRET;
+      assert.equal(await automationDataKey(env), dataKey);
+      await enableAutomation(env, dataKey);
+      assert.deepEqual((await db.prepare('SELECT wrapping_key FROM insb_automation_keys').all()).results, stored.results);
+      for (const path of ['/api/keepalive', '/api/telegram', '/api/accounts']) {
+        const response = await call(path);
+        assert.equal(response.status, 200);
+        for (const sensitive of [dataKey, stored.results[0].wrapping_key]) assert.equal(JSON.stringify(response.body).includes(sensitive), false);
+      }
+    } finally { await fixtureState.runtime.dispose(); }
+  });
+  await context.test('cron migrates legacy keys and bot tokens while preserving policies, credentials and webhook authorization', async () => {
+    const fixtureState = await fixture();
+    const { db, env, call, setPolicy, run, webhook, machines, operations } = fixtureState;
+    try {
+      await call('/api/telegram', 'PUT', { botToken, chatId, notifyOffline: true });
+      await setPolicy('machine-0'); await run();
+      const account = await db.prepare("SELECT key_ciphertext,key_iv FROM insb_accounts WHERE id='account-a'").first();
+      const policy = await db.prepare("SELECT mode,version,timezone,windows_json FROM insb_keepalive WHERE machine_id='machine-0'").first();
+      const authorization = await db.prepare('SELECT webhook_hash,chat_id FROM insb_telegram WHERE id=1').first();
+      await writeLegacyCredentials(db);
+      env.AUTOMATION_SECRET = automationSecret;
+      machines.get('machine-0')!.state = 'suspended';
+      await run(); assert.equal(operations.size, 1);
+      assert.equal((await db.prepare('SELECT key_ciphertext FROM insb_automation').first<any>()).key_ciphertext.startsWith('d1:'), true);
+      assert.equal((await db.prepare('SELECT token_ciphertext FROM insb_telegram').first<any>()).token_ciphertext.startsWith('d1:'), true);
+      assert.deepEqual(await db.prepare("SELECT key_ciphertext,key_iv FROM insb_accounts WHERE id='account-a'").first(), account);
+      assert.deepEqual(await db.prepare("SELECT mode,version,timezone,windows_json FROM insb_keepalive WHERE machine_id='machine-0'").first(), policy);
+      assert.deepEqual(await db.prepare('SELECT webhook_hash,chat_id FROM insb_telegram WHERE id=1').first(), authorization);
+      delete env.AUTOMATION_SECRET;
+      assert.equal(await automationDataKey(env), dataKey);
+      assert.equal((await webhook(1, '/status account-a machine-0')).status, 200);
+      assert.equal((await call('/api/telegram')).body.tokenRequired, false);
+      await run(); assert.equal(operations.size, 1);
+    } finally { await fixtureState.runtime.dispose(); }
+  });
+  await context.test('opening the logged-in panel recovers legacy keepalive without its old secret and allows re-entering the original bot token', async () => {
+    const fixtureState = await fixture();
+    const { db, env, call, setPolicy, run, webhook, machines, operations } = fixtureState;
+    try {
+      await call('/api/telegram', 'PUT', { botToken, chatId, notifyOffline: true });
+      await setPolicy('machine-0');
+      await writeLegacyCredentials(db);
+      assert.equal(env.AUTOMATION_SECRET, undefined);
+      const overview = await call('/api/keepalive');
+      assert.equal(overview.status, 200); assert.equal(overview.body.policies[0].mode, 'always');
+      machines.get('machine-0')!.state = 'suspended';
+      await run(); assert.equal(operations.size, 1);
+      const settings = await call('/api/telegram');
+      assert.equal(settings.status, 200); assert.equal(settings.body.enabled, true); assert.equal(settings.body.tokenRequired, true);
+      assert.equal((await call('/api/telegram', 'PUT', { botToken: '', chatId, notifyOffline: true })).body.error.code, 'telegram_token_required');
+      const repaired = await call('/api/telegram', 'PUT', { botToken, chatId, notifyOffline: true });
+      assert.equal(repaired.status, 200); assert.equal(repaired.body.tokenRequired, false);
+      assert.equal(repaired.body.lastError, ''); assert.equal(JSON.stringify(repaired.body).includes(botToken), false);
+      assert.equal((await webhook(1, '/status account-a machine-0')).status, 200);
+      assert.equal(await automationDataKey(env), dataKey);
+    } finally { await fixtureState.runtime.dispose(); }
+  });
+  await context.test('invalid persisted keys surface database errors instead of replacing the key and losing existing encrypted tokens', async () => {
+    const fixtureState = await fixture();
+    const { db, env, call, setPolicy } = fixtureState;
+    try {
+      await call('/api/telegram', 'PUT', { botToken, chatId, notifyOffline: false });
+      const token = await db.prepare('SELECT token_ciphertext,token_iv FROM insb_telegram').first();
+      const data = await db.prepare('SELECT key_ciphertext,key_iv FROM insb_automation').first();
+      await db.prepare("UPDATE insb_automation_keys SET wrapping_key='invalid' WHERE id=1").run();
+      const response = await setPolicy('machine-0');
+      assert.equal(response.status, 503); assert.equal(response.body.error.code, 'automation_key_invalid');
+      await assert.rejects(() => automationDataKey(env), (error: any) => error.code === 'automation_key_invalid');
+      assert.deepEqual(await db.prepare('SELECT token_ciphertext,token_iv FROM insb_telegram').first(), token);
+      assert.deepEqual(await db.prepare('SELECT key_ciphertext,key_iv FROM insb_automation').first(), data);
+      assert.equal((await db.prepare('SELECT wrapping_key FROM insb_automation_keys').first<any>()).wrapping_key, 'invalid');
+    } finally { await fixtureState.runtime.dispose(); }
+  });
+});
+
 test('the deployed worker exports authenticated fetch and a real workerd scheduled handler without login cookies', async () => {
   const bundle = await build({ entryPoints: ['src/worker/index.ts'], bundle: true, write: false, format: 'esm', platform: 'browser', loader: { '.sql': 'text' } });
   const upstream = `export default { async fetch(request) {
@@ -444,7 +571,7 @@ test('the deployed worker exports authenticated fetch and a real workerd schedul
     return new Response('not found', { status: 404 });
   } };`;
   const runtime = new Miniflare(convertV4MiniflareOptions({ workers: [
-    { name: 'panel', modules: true, script: bundle.outputFiles[0].text, compatibilityDate: '2026-10-19', d1Databases: ['DB'], bindings: { AUTOMATION_SECRET: automationSecret }, outboundService: 'upstream' },
+    { name: 'panel', modules: true, script: bundle.outputFiles[0].text, compatibilityDate: '2026-10-19', d1Databases: ['DB'], outboundService: 'upstream' },
     { name: 'upstream', modules: true, script: upstream, compatibilityDate: '2026-10-19' },
   ] }));
   try {
@@ -455,7 +582,7 @@ test('the deployed worker exports authenticated fetch and a real workerd schedul
     const timestamp = new Date().toISOString();
     await db.prepare("INSERT INTO insb_accounts (id,label,instabox_user_id,key_ciphertext,key_iv,key_suffix,created_at,updated_at) VALUES ('workerd-account','Cron fixture','workerd-user',?,?,'test',?,?)")
       .bind(encrypted.ciphertext, encrypted.iv, timestamp, timestamp).run();
-    await enableAutomation({ DB: db, AUTOMATION_SECRET: automationSecret }, dataKey);
+    await enableAutomation({ DB: db }, dataKey);
     await db.prepare("INSERT INTO insb_keepalive (machine_id,account_id,machine_name,mode,updated_at) VALUES ('workerd-machine','workerd-account','Cron fixture','always',?)").bind(timestamp).run();
     const worker = await runtime.getWorker('panel');
     const scheduledTime = new Date();

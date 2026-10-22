@@ -5,7 +5,7 @@ import { PanelError } from './errors';
 import { Instabox, type Fetcher } from './instabox';
 import { applyOperation } from './actions';
 import { database, ensureDatabase } from './schema';
-import { automationSecret, enableAutomation, hasAutomationSecret, type AutomationEnv } from './automation';
+import { enableAutomation, migrateAutomation, type AutomationEnv } from './automation';
 
 export type KeepaliveEnv = AutomationEnv;
 interface PolicyRow {
@@ -19,12 +19,13 @@ function view(row: PolicyRow): KeepalivePolicy {
     timezone: row.timezone, windows: JSON.parse(row.windows_json) as TimeWindow[],
     lastCheckedAt: row.last_checked_at, lastState: row.last_state, lastResult: row.last_result, lastError: row.last_error };
 }
-export async function keepaliveOverview(env: KeepaliveEnv): Promise<KeepaliveOverview> {
+export async function keepaliveOverview(env: KeepaliveEnv, dataKey?: string): Promise<KeepaliveOverview> {
   const db = database(env);
   await ensureDatabase(db);
+  if (dataKey) await migrateAutomation(env, dataKey);
   const policies = await db.prepare('SELECT * FROM insb_keepalive ORDER BY machine_name').all<PolicyRow>();
   const scheduler = await db.prepare('SELECT last_run_at FROM insb_scheduler WHERE id=1').first<{ last_run_at: number | null }>();
-  return { configured: hasAutomationSecret(env), intervalMinutes: KEEPALIVE_INTERVAL_MINUTES, maxMachines: KEEPALIVE_MAX_MACHINES,
+  return { intervalMinutes: KEEPALIVE_INTERVAL_MINUTES, maxMachines: KEEPALIVE_MAX_MACHINES,
     policies: policies.results.map(view), lastRunAt: scheduler?.last_run_at ?? null };
 }
 export async function saveKeepalive(env: KeepaliveEnv, account: AccountRow, machineId: string, value: unknown, dataKey: string, fetcher?: Fetcher) {
@@ -39,7 +40,6 @@ export async function saveKeepalive(env: KeepaliveEnv, account: AccountRow, mach
       .bind(new Date().toISOString(), machineId).run();
     return keepaliveOverview(env);
   }
-  automationSecret(env);
   if (!account.enabled) throw new PanelError(409, 'account_disabled', '请先启用这个账号。');
   const apiKey = await decryptKey(account.key_ciphertext, account.key_iv, dataKey, account.id);
   const machine = await new Instabox(apiKey, fetcher).machine(machineId);

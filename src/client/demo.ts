@@ -2,8 +2,8 @@ import type { Account, Action, Machine, ActionType } from '../shared/types';
 import { ApiError } from './api';
 import { validateSchedule, type KeepaliveOverview } from '../shared/keepalive';
 import type { TelegramStatus } from '../shared/telegram';
-let telegram: TelegramStatus = { configured: true, enabled: false, username: '', chatId: '', notifyOffline: false, lastError: '' };
-const keepalive: KeepaliveOverview = { configured: true, intervalMinutes: 1, maxMachines: 5, policies: [], lastRunAt: null };
+let telegram: TelegramStatus = { tokenRequired: true, enabled: false, username: '', chatId: '', notifyOffline: false, lastError: '' };
+const keepalive: KeepaliveOverview = { intervalMinutes: 1, maxMachines: 5, policies: [], lastRunAt: null };
 const stamp = () => new Date().toISOString();
 const accounts: Account[] = [
   { id: 'demo-main', label: '主账号', userId: '1001', login: 'darre', email: 'darre@example.com', keySuffix: '4f9a', enabled: true, createdAt: stamp(), updatedAt: stamp() },
@@ -46,8 +46,8 @@ export async function demoRequest(path: string, options: { method?: string; body
   if (!authenticated) throw new ApiError('authentication_required', '请先登录管理员账号。', 401);
   if (url.pathname === '/api/keepalive') return copy(keepalive);
   if (url.pathname === '/api/telegram') {
-    if (method === 'PUT') telegram = { ...telegram, enabled: true, username: 'instabox_demo_bot', chatId: body?.chatId || '', notifyOffline: Boolean(body?.notifyOffline) };
-    if (method === 'DELETE') { telegram = { ...telegram, enabled: false, username: '', chatId: '', notifyOffline: false }; return { ok: true, warning: '' }; }
+    if (method === 'PUT') telegram = { ...telegram, enabled: true, tokenRequired: false, username: 'instabox_demo_bot', chatId: body?.chatId || '', notifyOffline: Boolean(body?.notifyOffline) };
+    if (method === 'DELETE') { telegram = { ...telegram, enabled: false, tokenRequired: true, username: '', chatId: '', notifyOffline: false }; return { ok: true, warning: '' }; }
     return copy(telegram);
   }
   const keepaliveMatch = url.pathname.match(/^\/api\/accounts\/([^/]+)\/machines\/([^/]+)\/keepalive$/);

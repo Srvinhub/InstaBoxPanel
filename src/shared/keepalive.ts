@@ -6,7 +6,7 @@ export interface KeepalivePolicy {
   lastState: string; lastResult: string; lastError: string;
 }
 export interface KeepaliveOverview {
-  configured: boolean; intervalMinutes: number; maxMachines: number;
+  intervalMinutes: number; maxMachines: number;
   policies: KeepalivePolicy[]; lastRunAt: number | null;
 }
 export const KEEPALIVE_INTERVAL_MINUTES = 1;

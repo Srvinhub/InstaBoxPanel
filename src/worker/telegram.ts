@@ -1,7 +1,7 @@
 import type { TelegramStatus } from '../shared/telegram';
 import { stateLabels, type Machine, type ActionType } from '../shared/types';
-import { automationDataKey, automationSecret, enableAutomation, hasAutomationSecret, type AutomationEnv } from './automation';
-import { encryptKey, decryptKey } from './crypto';
+import { automationDataKey, decryptAutomation, encryptAutomation, enableAutomation, isDatabaseCredential, migrateAutomation, type AutomationEnv } from './automation';
+import { decryptKey } from './crypto';
 import { digest, encode } from './password';
 import { database, ensureDatabase } from './schema';
 import { PanelError } from './errors';
@@ -43,13 +43,32 @@ class Telegram {
   }
 }
 async function botRow(db: D1Database) { return db.prepare('SELECT * FROM insb_telegram WHERE id=1').first<BotRow>(); }
-async function botClient(env: AutomationEnv, row: BotRow, fetcher?: Fetcher) {
-  return new Telegram(await decryptKey(row.token_ciphertext, row.token_iv, automationSecret(env), 'telegram:1'), fetcher);
+async function storedBotToken(env: AutomationEnv, row: BotRow): Promise<string> {
+  const token = await decryptAutomation(env, row.token_ciphertext, row.token_iv, 'telegram:1');
+  if (!isDatabaseCredential(row.token_ciphertext)) {
+    await ensureDatabase(database(env));
+    const encrypted = await encryptAutomation(env, token, 'telegram:1');
+    await env.DB.prepare('UPDATE insb_telegram SET token_ciphertext=?,token_iv=? WHERE id=1 AND token_ciphertext=? AND token_iv=?')
+      .bind(encrypted.ciphertext, encrypted.iv, row.token_ciphertext, row.token_iv).run();
+  }
+  return token;
 }
-export async function telegramStatus(env: AutomationEnv): Promise<TelegramStatus> {
+async function botClient(env: AutomationEnv, row: BotRow, fetcher?: Fetcher) {
+  return new Telegram(await storedBotToken(env, row), fetcher);
+}
+export async function telegramStatus(env: AutomationEnv, dataKey?: string): Promise<TelegramStatus> {
   await ensureDatabase(database(env));
+  if (dataKey) await migrateAutomation(env, dataKey);
   const row = await botRow(env.DB);
-  return { configured: hasAutomationSecret(env), enabled: Boolean(row), username: row?.username || '', chatId: row?.chat_id || '',
+  let tokenRequired = !row;
+  if (row) {
+    try { await storedBotToken(env, row); }
+    catch (error) {
+      if (!(error instanceof PanelError && ['legacy_automation_credentials', 'automation_key_missing', 'automation_key_invalid', 'credential_decryption'].includes(error.code))) throw error;
+      tokenRequired = true;
+    }
+  }
+  return { tokenRequired, enabled: Boolean(row), username: row?.username || '', chatId: row?.chat_id || '',
     notifyOffline: Boolean(row?.notify_offline), lastError: row?.last_error || '' };
 }
 export async function saveTelegram(env: AutomationEnv, value: unknown, origin: string, dataKey: string, fetcher?: Fetcher) {
@@ -57,19 +76,28 @@ export async function saveTelegram(env: AutomationEnv, value: unknown, origin: s
   const body = value as { botToken?: unknown; chatId?: unknown; notifyOffline?: unknown } | null;
   if (!body || typeof body.chatId !== 'string' || !/^[1-9]\d{0,15}$/.test(body.chatId) || typeof body.notifyOffline !== 'boolean')
     throw new PanelError(400, 'invalid_telegram', '请填写个人聊天的数字 ID，并选择是否启用通知。');
-  const wrappingKey = automationSecret(env), previous = await botRow(env.DB);
-  const oldToken = previous ? await decryptKey(previous.token_ciphertext, previous.token_iv, wrappingKey, 'telegram:1') : '';
-  const token = typeof body.botToken === 'string' && body.botToken.trim() ? body.botToken.trim() : oldToken;
+  const previous = await botRow(env.DB);
+  const suppliedToken = typeof body.botToken === 'string' ? body.botToken.trim() : '';
+  let oldToken = '';
+  if (previous) {
+    try { oldToken = await storedBotToken(env, previous); }
+    catch (error) {
+      if (!(error instanceof PanelError && ['legacy_automation_credentials', 'automation_key_missing', 'credential_decryption'].includes(error.code))) throw error;
+      if (!suppliedToken) throw new PanelError(400, 'telegram_token_required', '请重新填写原机器人的 Bot Token 后保存，无需配置 Cloudflare 密钥。');
+    }
+  }
+  const token = suppliedToken || oldToken;
   if (!/^\d{5,20}:[A-Za-z0-9_-]{20,100}$/.test(token)) throw new PanelError(400, 'invalid_bot_token', '请输入 BotFather 提供的完整 Bot Token。');
-  if (previous && token !== oldToken) throw new PanelError(409, 'bot_already_bound', '更换机器人前，请先解除当前绑定。');
+  if (previous && oldToken && token !== oldToken) throw new PanelError(409, 'bot_already_bound', '更换机器人前，请先解除当前绑定。');
   const telegram = new Telegram(token, fetcher);
   const identity = await telegram.request('getMe');
   if (!identity?.is_bot || typeof identity.username !== 'string') throw new PanelError(502, 'invalid_bot', '无法验证 Telegram 机器人。');
+  if (previous && !oldToken && identity.username !== previous.username) throw new PanelError(409, 'bot_already_bound', '恢复绑定请填写原机器人的 Token；更换机器人前，请先解除当前绑定。');
   const chat = await telegram.request('getChat', { chat_id: body.chatId });
   if (chat?.type !== 'private' || String(chat.id) !== body.chatId) throw new PanelError(400, 'private_chat_required', '仅支持绑定你自己的私人聊天，不支持群组或频道。');
   await enableAutomation(env, dataKey);
   const webhookSecret = encode(crypto.getRandomValues(new Uint8Array(32))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-  const encrypted = await encryptKey(token, wrappingKey, 'telegram:1');
+  const encrypted = await encryptAutomation(env, token, 'telegram:1');
   await telegram.request('setWebhook', { url: origin + '/api/telegram/webhook', secret_token: webhookSecret, allowed_updates: ['message'], max_connections: 1 });
   try {
     await env.DB.batch([
@@ -211,7 +239,7 @@ export async function checkTelegramNotifications(env: AutomationEnv, dataKey: st
   try { telegram = await botClient(env, bot, fetcher); }
   catch {
     await db.prepare('UPDATE insb_telegram SET last_error=? WHERE id=1 AND webhook_hash=?')
-      .bind('无法解密机器人凭据；如果已轮换 AUTOMATION_SECRET，请解除绑定后重新绑定。保活不受影响。', bot.webhook_hash).run();
+      .bind('无法解密机器人凭据，请在面板重新填写原机器人 Token，或解除绑定后重新绑定。保活不受影响。', bot.webhook_hash).run();
     return;
   }
   const accounts = await db.prepare('SELECT * FROM insb_accounts WHERE enabled=1 AND deleted_at IS NULL ORDER BY id').all<AccountRow>();

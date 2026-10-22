@@ -45,10 +45,9 @@ export default function KeepaliveForm({ row, overview, close, saved }: {
         </>}
         <div className="notice"><HeartPulse size={17}/><span>自动暂停后通常在下一分钟检查时发起恢复，实际恢复还需启动时间。已停止的机器需手动启动；保活开启时，手动暂停也会被下一次检查恢复。最多同时保活 {overview.maxMachines} 台。</span></div>
       </>}
-      {!overview.configured && <div className="notice">启用保活前，请在 CF 后台添加密钥 AUTOMATION_SECRET。可在本地执行 npm run secret:generate 生成，设置方法见 README。关闭保活不需要该密钥。</div>}
       {current?.lastCheckedAt && <p className="field-help">最近检查：{new Date(current.lastCheckedAt).toLocaleString('zh-CN')} · {current.lastResult}{current.lastError && ' · ' + current.lastError}</p>}
       {error && <div className="notice error" role="alert">{error}</div>}
-      <button className="button primary" disabled={busy || (mode !== 'off' && !overview.configured)}>{busy ? <LoaderCircle size={16} className="spin"/> : <Check size={16}/>}保存保活设置</button>
+      <button className="button primary" disabled={busy}>{busy ? <LoaderCircle size={16} className="spin"/> : <Check size={16}/>}保存保活设置</button>
     </form>
   </Modal>;
 }

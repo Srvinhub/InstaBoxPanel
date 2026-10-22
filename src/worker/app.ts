@@ -97,8 +97,8 @@ export function createApp(deps: Dependencies = {}) {
     const result = await c.env.DB.prepare('SELECT * FROM insb_accounts WHERE deleted_at IS NULL ORDER BY created_at').all<AccountRow>();
     return c.json({ accounts: result.results.map(accountView) });
   });
-  app.get('/api/keepalive', async c => c.json(await keepaliveOverview(c.env)));
-  app.get('/api/telegram', async c => c.json(await telegramStatus(c.env)));
+  app.get('/api/keepalive', async c => c.json(await keepaliveOverview(c.env, c.get('identity').key)));
+  app.get('/api/telegram', async c => c.json(await telegramStatus(c.env, c.get('identity').key)));
   app.put('/api/telegram', async c => c.json(await saveTelegram(c.env, await jsonBody(c.req.raw), new URL(c.req.url).origin, c.get('identity').key, deps.fetcher)));
   app.delete('/api/telegram', async c => c.json(await removeTelegram(c.env, deps.fetcher)));
   app.put('/api/accounts/:id/machines/:machineId/keepalive', async c => {

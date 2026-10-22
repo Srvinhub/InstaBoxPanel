@@ -78,7 +78,7 @@ function Dashboard({session,signedOut}:{session:Session;signedOut:()=>void}){
   const [loaded,setLoaded]=useState(false),[refreshing,setRefreshing]=useState(false),[selected,setSelected]=useState('all'),[filter,setFilter]=useState('all'),[search,setSearch]=useState('');
   const [form,setForm]=useState<Account|'new'|null>(null),[detail,setDetail]=useState<MachineRow|null>(null),[history,setHistory]=useState(false);
   const [terminals,setTerminals]=useState<MachineRow[]>([]),[activeTerminal,setActiveTerminal]=useState('');
-  const [keepalive,setKeepalive]=useState<KeepaliveOverview>({configured:false,intervalMinutes:1,maxMachines:5,policies:[],lastRunAt:null}),[keepaliveRow,setKeepaliveRow]=useState<MachineRow|null>(null);
+  const [keepalive,setKeepalive]=useState<KeepaliveOverview>({intervalMinutes:1,maxMachines:5,policies:[],lastRunAt:null}),[keepaliveRow,setKeepaliveRow]=useState<MachineRow|null>(null);
   const [telegramOpen,setTelegramOpen]=useState(false);
   const [submitting,setSubmitting]=useState(new Set<string>()),[toast,setToast]=useState<{text:string;error:boolean}|null>(null),[progressError,setProgressError]=useState('');
   const [visible,setVisible]=useState(!document.hidden),[tick,setTick]=useState(0);
