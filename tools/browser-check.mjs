@@ -1,0 +1,64 @@
+import assert from 'node:assert/strict';
+import { chromium } from 'playwright';
+import { spawn } from 'node:child_process';
+import { access, mkdir, writeFile } from 'node:fs/promises';
+import path from 'node:path';
+const root=process.cwd(),base='http://127.0.0.1:4177',output=path.join(root,'test-results');
+await mkdir(output,{recursive:true});
+let executablePath;
+for(const candidate of [process.env.PLAYWRIGHT_EXECUTABLE_PATH,'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe','C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'].filter(Boolean)){try{await access(candidate);executablePath=candidate;break;}catch{}}
+const child=spawn(process.execPath,[path.join(root,'node_modules/vite/bin/vite.js'),'--mode','demo','--host','127.0.0.1','--port','4177'],{cwd:root,windowsHide:true,stdio:['ignore','pipe','pipe']});
+let serverLog='';child.stdout.on('data',d=>serverLog=(serverLog+d).slice(-4000));child.stderr.on('data',d=>serverLog=(serverLog+d).slice(-4000));
+let browser;const failures=[],steps=[];
+function step(name){steps.push(name);console.log('PASS '+name);}
+try{
+  let ready=false;for(let i=0;i<100;i++){try{ready=(await fetch(base)).ok;}catch{}if(ready)break;await new Promise(r=>setTimeout(r,150));}assert.ok(ready,'Vite did not start: '+serverLog);
+  browser=await chromium.launch({headless:true,...(executablePath?{executablePath}:{})});
+  const context=await browser.newContext({viewport:{width:1440,height:1000},deviceScaleFactor:1});
+  const page=await context.newPage();page.on('pageerror',e=>failures.push(e.stack||e.message));page.on('console',m=>{if(m.type()==='error')failures.push(m.text()+' '+JSON.stringify(m.location()));});
+  await page.goto(base);await page.getByRole('heading',{name:'设置管理员账号',exact:true}).waitFor();
+  await page.screenshot({path:path.join(output,'setup-desktop.png')});
+  await page.getByLabel('管理员账号',{exact:true}).fill('panel-admin');await page.getByLabel('密码',{exact:true}).fill('browser-demo-password');await page.getByLabel('确认密码',{exact:true}).fill('different-password');
+  await page.getByRole('button',{name:'创建管理员并进入',exact:true}).click();await page.getByText('两次输入的密码不一致。',{exact:true}).waitFor();
+  await page.getByLabel('确认密码',{exact:true}).fill('browser-demo-password');await page.getByRole('button',{name:'创建管理员并进入',exact:true}).click();await page.locator('[data-machine="development"]').waitFor();step('first-use admin setup validates matching passwords');
+  await page.getByRole('button',{name:'退出登录',exact:true}).filter({visible:true}).click();await page.getByRole('heading',{name:'登录私人控制台',exact:true}).waitFor();
+  await page.getByLabel('管理员账号',{exact:true}).fill('panel-admin');await page.getByLabel('密码',{exact:true}).fill('wrong-password');await page.getByRole('button',{name:'登录',exact:true}).click();await page.getByText('账号或密码不正确。',{exact:true}).waitFor();
+  await page.screenshot({path:path.join(output,'login-desktop.png')});await page.getByLabel('密码',{exact:true}).fill('browser-demo-password');await page.getByRole('button',{name:'登录',exact:true}).click();await page.locator('[data-machine="development"]').waitFor();step('logout, rejected password, and successful admin login');
+  assert.equal(await page.locator('.machines tbody tr').count(),5);assert.ok((await page.locator('.demo-banner').innerText()).includes('演示模式'));
+  step('dashboard loads five machines');await page.screenshot({path:path.join(output,'dashboard-desktop.png'),fullPage:true});
+  await page.getByRole('button',{name:'已暂停',exact:true}).click();assert.equal(await page.locator('.machines tbody tr').count(),2);
+  await page.getByRole('button',{name:'全部',exact:true}).click();await page.getByRole('textbox',{name:'搜索机器'}).fill('development');assert.equal(await page.locator('.machines tbody tr').count(),1);
+  await page.getByRole('textbox',{name:'搜索机器'}).fill('no-such-machine');await page.getByRole('heading',{name:'没有匹配的机器'}).waitFor();await page.getByRole('textbox',{name:'搜索机器'}).fill('');
+  step('search, filters, and empty state');
+  const dev=page.locator('[data-machine="development"]');
+  await dev.getByRole('button',{name:'暂停',exact:true}).click();await dev.locator('.state-badge').filter({hasText:'已暂停'}).waitFor({timeout:10000});
+  await dev.getByRole('button',{name:'恢复',exact:true}).click();await dev.locator('.state-badge').filter({hasText:'运行中'}).waitFor({timeout:10000});
+  step('pause and resume wait for completion');
+  await page.getByRole('button',{name:'查看 development 详情',exact:true}).click();await page.locator('dialog').getByText('空闲自动暂停',{exact:true}).waitFor();
+  await page.locator('dialog').getByRole('button',{name:'停止机器…',exact:true}).click();await page.getByText('确认结束这台机器上的所有进程？',{exact:true}).waitFor();
+  await page.locator('dialog').getByRole('button',{name:'取消',exact:true}).click();await page.locator('dialog').getByRole('button',{name:'关闭',exact:true}).click();
+  step('machine detail and stop confirmation');
+  await page.getByRole('button',{name:'打开 development 终端',exact:true}).click();await page.locator('.terminal-dialog').waitFor();
+  const terminal=page.locator('.xterm-helper-textarea');await terminal.waitFor();await terminal.focus();await terminal.pressSequentially('ls');await terminal.press('Enter');
+  await page.waitForFunction(()=>document.querySelector('.xterm-rows')?.textContent?.includes('README.md'));
+  await terminal.press('Escape');assert.equal(await page.locator('.terminal-dialog').isVisible(),true);
+  await page.getByRole('button',{name:'Ctrl+C',exact:true}).click();await page.getByRole('button',{name:'放大终端字体',exact:true}).click();
+  await page.screenshot({path:path.join(output,'terminal-desktop.png')});
+  await page.getByRole('button',{name:'重新连接终端',exact:true}).click();await page.waitForFunction(()=>document.querySelector('.xterm-rows')?.textContent?.includes('InstaBox Panel'));
+  await page.getByRole('button',{name:'关闭终端',exact:true}).click();step('terminal ANSI output, keyboard input, Esc, and reconnect');
+  await page.locator('.page-heading').getByRole('button',{name:'添加账号',exact:true}).click();
+  await page.getByLabel('账号别名',{exact:true}).fill('测试失效账号');await page.getByLabel('API Key',{exact:true}).fill('ibk_demo_error');await page.getByRole('button',{name:'保存账号',exact:true}).click();
+  await page.locator('.account-error').filter({hasText:'测试失效账号'}).waitFor();assert.equal(await page.locator('.machines tbody tr').count(),5);
+  step('one failed account does not hide other machines');
+  await page.getByRole('button',{name:'管理账号 测试失效账号',exact:true}).click();await page.getByLabel('替换 API Key',{exact:true}).fill('ibk_demo_example');await page.getByRole('button',{name:'保存账号',exact:true}).click();await page.locator('.account-error').waitFor({state:'detached'});
+  await page.getByRole('button',{name:'管理账号 测试失效账号',exact:true}).click();await page.getByRole('button',{name:'移除账号',exact:true}).click();await page.getByRole('button',{name:'确认移除',exact:true}).click();await page.getByRole('button',{name:'管理账号 测试失效账号',exact:true}).waitFor({state:'detached'});
+  assert.equal(await page.locator('.machines tbody tr').count(),5);step('key replacement and account removal');
+  await page.setViewportSize({width:390,height:844});await page.getByRole('combobox',{name:'当前账号'}).selectOption('demo-lab');assert.equal(await page.locator('.machines tbody tr').count(),2);
+  await page.getByRole('combobox',{name:'当前账号'}).selectOption('all');assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),'mobile horizontal overflow');
+  await page.screenshot({path:path.join(output,'dashboard-mobile.png'),fullPage:true});
+  await page.getByRole('button',{name:'打开 development 终端',exact:true}).click();await page.locator('.xterm-helper-textarea').waitFor();assert.ok(await page.evaluate(()=>document.querySelector('.terminal-dialog').getBoundingClientRect().width<=innerWidth));
+  await page.screenshot({path:path.join(output,'terminal-mobile.png')});await page.getByRole('button',{name:'关闭终端',exact:true}).click();step('mobile selection, dashboard layout, and terminal');
+  await page.getByRole('button',{name:'退出登录',exact:true}).filter({visible:true}).click();await page.getByRole('heading',{name:'登录私人控制台',exact:true}).waitFor();assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));await page.screenshot({path:path.join(output,'login-mobile.png')});step('mobile logout and login layout');
+  assert.deepEqual(failures,[],'browser errors');await writeFile(path.join(output,'browser-report.json'),JSON.stringify({passed:steps,errors:failures},null,2)+'\n');console.log('Browser checks passed: '+steps.length);
+}catch(error){if(browser){const page=browser.contexts()[0]?.pages()[0];if(page)await page.screenshot({path:path.join(output,'failure.png'),fullPage:true}).catch(()=>{});}console.error(error);process.exitCode=1;}
+finally{await browser?.close();child.kill();}

@@ -1,0 +1,13 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "instabox-panel",
+  "compatibility_date": "2026-10-19",
+  // Optional configuration for manual migrations; runtime initialization needs only DB in the dashboard.
+  "d1_databases": [{
+    "binding": "DB",
+    "database_name": "instabox-panel",
+    "database_id": "00000000-0000-0000-0000-000000000000",
+    "migrations_dir": "migrations",
+    "migrations_table": "insb_d1_migrations"
+  }]
+}

@@ -40,13 +40,14 @@ Windows PowerShell 如果阻止执行 npm.ps1，请改用 npm.cmd / npx.cmd。
 
 通过 Cloudflare 后台部署：
 
-1. 将本项目上传到自己的 Git 仓库，例如 GitHub。
+1. 将本项目的完整源码提交并推送到自己的 Git 仓库，例如 GitHub。仓库应包含 `package.json`、`package-lock.json`、`wrangler.jsonc`、`index.html`、TypeScript/Vite 配置，以及 `src/`、`migrations/`、`tools/`、`tests/` 等源码目录；不能只上传 README。`node_modules/`、`dist/` 和本地数据库无需上传。
 2. 在 Cloudflare 控制台进入 **Workers & Pages**，创建 Worker 并连接该仓库，使用 **Workers Builds** 部署。
 3. 选择包含 `package.json` 和 `wrangler.jsonc` 的项目根目录，填写以下构建配置：
 
    | 配置 | 值 |
    | --- | --- |
    | Worker 名称 | `instabox-panel`，与 `wrangler.jsonc` 中的 `name` 一致 |
+   | 根目录 | `package.json` 所在目录；源码在仓库顶层时使用默认仓库根目录 |
    | 构建命令 | `npm run build` |
    | 部署命令 | `npx wrangler deploy` |
 
@@ -59,6 +60,12 @@ npm ci
 npx wrangler login
 npm run deploy
 ~~~
+
+如果构建提示 `ENOENT: Could not read package.json`，请检查该次构建使用的仓库、分支和提交是否包含源码：
+
+- GitHub 上只有 README：将本地源码提交并推送，再构建包含源码的最新提交；只在本地保存文件并不会上传到 GitHub。
+- `package.json` 位于仓库子目录，例如 `InstaBoxPanel/package.json`：将 CF 构建根目录设置为 `InstaBoxPanel`，构建命令和部署命令保持不变。
+- `package.json` 已在仓库顶层：使用默认仓库根目录，并确认 CF 构建的是包含该文件的分支和提交。
 
 ### 2. 在 Cloudflare 后台配置 DB
 

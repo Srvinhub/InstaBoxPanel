@@ -1,0 +1,94 @@
+import type { Account, Action, Machine, ActionType } from '../shared/types';
+import { ApiError } from './api';
+const stamp = () => new Date().toISOString();
+const accounts: Account[] = [
+  { id: 'demo-main', label: '主账号', userId: '1001', login: 'darre', email: 'darre@example.com', keySuffix: '4f9a', enabled: true, createdAt: stamp(), updatedAt: stamp() },
+  { id: 'demo-lab', label: '实验室', userId: '1002', login: 'darre-lab', email: 'lab@example.com', keySuffix: '82bc', enabled: true, createdAt: stamp(), updatedAt: stamp() },
+];
+function machine(id: string, name: string, state: Machine['state']): Machine {
+  return { id, name, state, orgId: 'org_personal', operationId: null, revision: 1, autoSuspendAfterSeconds: 1800,
+    createdAt: stamp(), updatedAt: stamp(), spec: { vcpus: 4, memMiB: 8192 }, runtime: { ready: state === 'running' } };
+}
+const machines: Record<string, Machine[]> = {
+  'demo-main': [machine('m_development', 'development', 'running'), machine('m_browser', 'browser-agent', 'suspended'), machine('m_notes', 'personal-workspace', 'running')],
+  'demo-lab': [machine('m_experiment', 'experiment', 'stopped'), machine('m_preview', 'web-preview', 'suspended')],
+};
+const actions: Action[] = [];
+const failedAccounts = new Set<string>();
+const copy = <T,>(value: T): T => structuredClone(value);
+let administrator: { username: string; password: string } | null = null;
+let authenticated = false;
+const session = () => ({ username: authenticated ? administrator!.username : '', authenticated, setupRequired: !administrator, demo: true });
+export async function demoRequest(path: string, options: { method?: string; body?: unknown; signal?: AbortSignal }): Promise<unknown> {
+  await new Promise(resolve => setTimeout(resolve, 180));
+  if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+  const url = new URL(path, 'http://demo.local');
+  const method = options.method || 'GET';
+  const body = options.body as Record<string, any> | undefined;
+  if (url.pathname === '/api/session') return session();
+  if (url.pathname === '/api/auth/setup' && method === 'POST') {
+    if (administrator) throw new ApiError('already_initialized', '管理员已经设置，请直接登录。', 409);
+    if (!/^[a-zA-Z0-9_.@-]{3,64}$/.test(body?.username || '') || typeof body?.password !== 'string' || body.password.length < 12)
+      throw new ApiError('invalid_credentials_format', '请使用至少 3 个字符的账号和至少 12 个字符的示例密码。', 400);
+    administrator = { username: body.username.toLowerCase(), password: body.password }; authenticated = true; return session();
+  }
+  if (url.pathname === '/api/auth/login' && method === 'POST') {
+    if (!administrator) throw new ApiError('setup_required', '请先设置管理员账号。', 409);
+    if (body?.username?.toLowerCase() !== administrator.username || body?.password !== administrator.password)
+      throw new ApiError('invalid_credentials', '账号或密码不正确。', 401);
+    authenticated = true; return session();
+  }
+  if (url.pathname === '/api/auth/logout' && method === 'POST') { authenticated = false; return { ok: true }; }
+  if (!authenticated) throw new ApiError('authentication_required', '请先登录管理员账号。', 401);
+  if (url.pathname === '/api/accounts' && method === 'GET') return { accounts: copy(accounts) };
+  if (url.pathname === '/api/accounts' && method === 'POST') {
+    if (!body?.apiKey?.startsWith('ibk_demo_')) throw new ApiError('demo_key', '演示模式请使用示例密钥 ibk_demo_example。');
+    const row: Account = { id: crypto.randomUUID(), label: body.label, userId: crypto.randomUUID(), login: 'demo-user', email: '', keySuffix: body.apiKey.slice(-4), enabled: true, createdAt: stamp(), updatedAt: stamp() };
+    accounts.push(row); machines[row.id] = [];
+    if (body.apiKey === 'ibk_demo_error') failedAccounts.add(row.id);
+    return { account: copy(row) };
+  }
+  const a = url.pathname.match(/^\/api\/accounts\/([^/]+)$/);
+  if (a) {
+    const row = accounts.find(x => x.id === a[1]);
+    if (!row) throw new ApiError('not_found', '账号不存在。');
+    if (method === 'PATCH') {
+      if (body?.apiKey && !body.apiKey.startsWith('ibk_demo_')) throw new ApiError('demo_key', '演示模式请使用 ibk_demo_example。');
+      if (body?.label) row.label = body.label;
+      if (typeof body?.enabled === 'boolean') row.enabled = body.enabled;
+      if (body?.apiKey) { row.keySuffix = body.apiKey.slice(-4); failedAccounts.delete(row.id); }
+      return { account: copy(row) };
+    }
+    if (method === 'DELETE') { accounts.splice(accounts.indexOf(row), 1); return { ok: true }; }
+  }
+  const list = url.pathname.match(/^\/api\/accounts\/([^/]+)\/machines$/);
+  if (list) {
+    if (failedAccounts.has(list[1])) throw new ApiError('api_key_revoked', '这个账号的 API Key 已撤销，请替换。');
+    return { accountId: list[1], machines: copy(machines[list[1]] || []), checkedAt: stamp() };
+  }
+  if (url.pathname === '/api/actions') return { actions: copy(actions) };
+  const change = url.pathname.match(/^\/api\/accounts\/([^/]+)\/machines\/([^/]+)\/actions$/);
+  if (change && body) {
+    const old = actions.find(x => x.id === body.requestId);
+    if (old) return { action: copy(old) };
+    const m = machines[change[1]]?.find(x => x.id === change[2]);
+    if (!m) throw new ApiError('not_found', '机器不存在。');
+    const type = body.type as ActionType;
+    const record: Action = { id: body.requestId, accountId: change[1], machineId: m.id, machineName: m.name, type,
+      state: 'running', operationId: 'op_' + body.requestId, phase: 'waiting_ready', errorCode: null, errorMessage: null,
+      processesPreserved: null, createdAt: stamp(), updatedAt: stamp() };
+    actions.unshift(record);
+    m.state = { suspend: 'suspending', resume: 'resuming', start: 'starting', stop: 'stopping' }[type] as Machine['state'];
+    m.operationId = record.operationId;
+    setTimeout(() => {
+      m.state = type === 'suspend' ? 'suspended' : type === 'stop' ? 'stopped' : 'running';
+      m.runtime.ready = m.state === 'running'; m.operationId = null; m.revision++; m.updatedAt = stamp();
+      record.state = 'succeeded'; record.phase = ''; record.updatedAt = stamp();
+      record.processesPreserved = type === 'resume' ? true : null;
+    }, 1400);
+    return { action: copy(record) };
+  }
+  const getAction = url.pathname.match(/^\/api\/actions\/([^/]+)$/);
+  if (getAction) return { action: copy(actions.find(x => x.id === getAction[1])) };
+  throw new ApiError('not_found', '演示接口不存在。');
+}
