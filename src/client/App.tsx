@@ -1,8 +1,11 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type FormEvent } from 'react';
-import { Activity, ArrowUpRight, Box, Check, ChevronRight, CircleAlert, Clock3, Ellipsis, Layers3, LoaderCircle, LogOut, Pause, Play, Plus, RefreshCw, Search, Server, ShieldCheck, Square, TerminalSquare, X } from 'lucide-react';
+import { Activity, ArrowUpRight, Box, Check, ChevronRight, CircleAlert, Clock3, Ellipsis, HeartPulse, Layers3, LoaderCircle, LogOut, Pause, Play, Plus, RefreshCw, Search, Send, Server, ShieldCheck, Square, TerminalSquare, X } from 'lucide-react';
 import { api, ApiError, concurrent, isDemo } from './api';
 import { actionLabels, stateLabels, type Account, type AccountMachines, type Action, type ActionType, type Machine, type Session } from '../shared/types';
 import AuthScreen from './AuthScreen';
+import KeepaliveForm from './KeepaliveForm';
+import TelegramForm from './TelegramForm';
+import type { KeepaliveOverview } from '../shared/keepalive';
 const TerminalPane = lazy(() => import('./TerminalPane'));
 
 interface Snapshot extends Partial<AccountMachines> { error?: string; failures?: number; retryAt?: number }
@@ -73,7 +76,10 @@ function Dashboard({session,signedOut}:{session:Session;signedOut:()=>void}){
   const snapshotsRef=useRef(snapshots);snapshotsRef.current=snapshots;
   const seq=useRef<Record<string,number>>({}),refreshLock=useRef(false),submitLock=useRef(new Set<string>());
   const [loaded,setLoaded]=useState(false),[refreshing,setRefreshing]=useState(false),[selected,setSelected]=useState('all'),[filter,setFilter]=useState('all'),[search,setSearch]=useState('');
-  const [form,setForm]=useState<Account|'new'|null>(null),[detail,setDetail]=useState<MachineRow|null>(null),[terminal,setTerminal]=useState<MachineRow|null>(null),[history,setHistory]=useState(false);
+  const [form,setForm]=useState<Account|'new'|null>(null),[detail,setDetail]=useState<MachineRow|null>(null),[history,setHistory]=useState(false);
+  const [terminals,setTerminals]=useState<MachineRow[]>([]),[activeTerminal,setActiveTerminal]=useState('');
+  const [keepalive,setKeepalive]=useState<KeepaliveOverview>({configured:false,intervalMinutes:1,maxMachines:5,policies:[],lastRunAt:null}),[keepaliveRow,setKeepaliveRow]=useState<MachineRow|null>(null);
+  const [telegramOpen,setTelegramOpen]=useState(false);
   const [submitting,setSubmitting]=useState(new Set<string>()),[toast,setToast]=useState<{text:string;error:boolean}|null>(null),[progressError,setProgressError]=useState('');
   const [visible,setVisible]=useState(!document.hidden),[tick,setTick]=useState(0);
   const notify=useCallback((text:string,error=false)=>setToast({text,error}),[]);
@@ -101,11 +107,15 @@ function Dashboard({session,signedOut}:{session:Session;signedOut:()=>void}){
   useEffect(()=>{
     let cancelled=false;
     void(async()=>{try{
-      const [a,b]=await Promise.all([api<{accounts:Account[]}>('/api/accounts'),api<{actions:Action[]}>('/api/actions')]);if(cancelled)return;
-      accountsRef.current=a.accounts;setAccounts(a.accounts);setActions(b.actions);await refresh(true);if(!cancelled)setLoaded(true);
+      const [a,b,automation]=await Promise.all([api<{accounts:Account[]}>('/api/accounts'),api<{actions:Action[]}>('/api/actions'),api<KeepaliveOverview>('/api/keepalive')]);if(cancelled)return;
+      accountsRef.current=a.accounts;setAccounts(a.accounts);setActions(b.actions);setKeepalive(automation);await refresh(true);if(!cancelled)setLoaded(true);
     }catch(e){if(!cancelled){authError(e);setFatal(message(e));}}})();
     return()=>{cancelled=true;};
   },[refresh,authError]);
+  useEffect(()=>{
+    const timer=setInterval(()=>{if(!document.hidden){void api<KeepaliveOverview>('/api/keepalive').then(setKeepalive).catch(authError);void api<{actions:Action[]}>('/api/actions').then(value=>setActions(value.actions)).catch(authError);}},60000);
+    return()=>clearInterval(timer);
+  },[authError]);
   useEffect(()=>{
     if(!session||fatal)return;
     const timer=setInterval(()=>{if(!document.hidden)void refresh();},10000);
@@ -179,7 +189,20 @@ function Dashboard({session,signedOut}:{session:Session;signedOut:()=>void}){
     if(!type||r.machine.operationId)return <span className="muted operation-hint">等待操作完成</span>;
     return <button className={'button compact '+(type==='suspend'?'':'resume-button')} disabled={r.stale} onClick={()=>void change(r,type)}>{type==='suspend'?<Pause size={14}/>:<Play size={14}/>} {actionLabels[type]}</button>;
   }
-  const latest=(r:MachineRow)=>rows.find(x=>x.machine.id===r.machine.id)||r;
+  const latest=(row:MachineRow):MachineRow=>{
+    const account=accounts.find(item=>item.id===row.account.id);
+    const snapshot=snapshots[row.account.id];
+    const machine=snapshot?.machines?.find(item=>item.id===row.machine.id);
+    return {...row,account:account||{...row.account,enabled:false},machine:machine||row.machine,
+      checkedAt:snapshot?.checkedAt||row.checkedAt,stale:!account||Boolean(snapshot?.error)||Date.now()-Date.parse(snapshot?.checkedAt||'')>30000};
+  };
+  function openTerminal(row:MachineRow){
+    if(!terminals.some(item=>item.machine.id===row.machine.id)){
+      if(terminals.length>=8){notify('最多同时打开 8 个终端，请先关闭一个窗口。',true);return;}
+      setTerminals(current=>[...current,row]);
+    }
+    setActiveTerminal(row.machine.id);
+  }
   async function logout(){
     try{await api('/api/auth/logout',{method:'POST',body:{}});signedOut();}catch(error){authError(error);notify(message(error),true);}
   }
@@ -196,7 +219,7 @@ function Dashboard({session,signedOut}:{session:Session;signedOut:()=>void}){
       <button className="add-account" onClick={()=>setForm('new')}><Plus size={16}/>连接另一个账号</button>
       <div className="sidebar-bottom"><div className="protected"><ShieldCheck size={16}/>{isDemo?'本地演示空间':'私人访问已保护'}</div><div className="profile"><span className="profile-avatar">{session.username[0]?.toUpperCase()||'I'}</span><div><strong>{session.username}</strong><small>管理员</small></div><button className="icon-button" aria-label="退出登录" onClick={()=>void logout()}><LogOut size={16}/></button></div></div>
     </aside>
-    <main className="main"><header className="topbar"><div className="breadcrumb">工作空间<ChevronRight size={14}/><strong>{selected==='all'?'全部机器':accounts.find(a=>a.id===selected)?.label}</strong></div><div className="topbar-links"><a className="official-link" href="https://dashboard.instabox.sh" target="_blank" rel="noreferrer">官方控制台<ArrowUpRight size={14}/></a><button className="icon-button mobile-logout" aria-label="退出登录" onClick={()=>void logout()}><LogOut size={16}/></button></div></header>
+    <main className="main"><header className="topbar"><div className="breadcrumb">工作空间<ChevronRight size={14}/><strong>{selected==='all'?'全部机器':accounts.find(a=>a.id===selected)?.label}</strong></div><div className="topbar-links"><button className="text-button telegram-settings" aria-label="Telegram 设置" onClick={()=>setTelegramOpen(true)}><Send size={14}/>Telegram</button><a className="official-link" href="https://dashboard.instabox.sh" target="_blank" rel="noreferrer">官方控制台<ArrowUpRight size={14}/></a><button className="icon-button mobile-logout" aria-label="退出登录" onClick={()=>void logout()}><LogOut size={16}/></button></div></header>
     <div className="content">
       {isDemo&&<div className="demo-banner"><span className="demo-dot"/><strong>演示模式</strong><span>示例账号与机器，按钮操作不会影响真实资源。</span></div>}
       <div className="page-heading"><div><div className="eyebrow">YOUR MACHINES, TOGETHER</div><h1>{selected==='all'?'机器总览':accounts.find(a=>a.id===selected)?.label}</h1><p>让每一台机器，都在掌握之中。</p></div><button className="button primary" onClick={()=>setForm('new')}><Plus size={17}/>添加账号</button></div>
@@ -213,16 +236,18 @@ function Dashboard({session,signedOut}:{session:Session;signedOut:()=>void}){
           <td><span className="account-pill">{r.account.label}</span>{r.sources.length>1&&<small className="source-count">另外 {r.sources.length-1} 个账号可访问</small>}</td>
           <td><span className={'state-badge '+(r.stale?'unknown':r.machine.state)}><span/>{r.stale?'数据已过期':stateLabels[r.machine.state]}</span>{r.stale?<small className="state-detail">上次：{stateLabels[r.machine.state]}</small>:r.machine.state==='running'&&!r.machine.runtime.ready?<small className="state-detail">等待服务就绪</small>:null}</td>
           <td className="last-checked"><Clock3 size={13}/>{ago(r.checkedAt)}</td>
-          <td className="actions-cell"><div className="row-actions">{control(r)}<button className="icon-button" aria-label={'打开 '+r.machine.name+' 终端'} disabled={r.stale} onClick={()=>setTerminal(r)}><TerminalSquare size={17}/></button><button className="icon-button" aria-label={'查看 '+r.machine.name+' 详情'} onClick={()=>setDetail(r)}><Ellipsis size={18}/></button></div></td>
+          <td className="actions-cell"><div className="row-actions">{control(r)}<button className="icon-button" aria-label={'打开 '+r.machine.name+' 终端'} disabled={r.stale} onClick={()=>openTerminal(r)}><TerminalSquare size={17}/></button><button className={'icon-button keepalive-button'+(keepalive.policies.some(policy=>policy.machineId===r.machine.id&&policy.mode!=='off')?' enabled':'')} aria-label={'设置 '+r.machine.name+' 保活'} title="设置保活" onClick={()=>setKeepaliveRow(r)}><HeartPulse size={17}/></button><button className="icon-button" aria-label={'查看 '+r.machine.name+' 详情'} onClick={()=>setDetail(r)}><Ellipsis size={18}/></button></div></td>
         </tr>)}</tbody></table></div>}
         <footer className="panel-footer"><span><ShieldCheck size={14}/>状态查询不会唤醒机器，也不会重置空闲计时。</span><span>{refreshing?'正在同步…':errors.length?'部分账号未同步':'按账号独立同步'}</span></footer>
       </section>
-      <div className="bottom-note"><Pause size={15}/><span>主动暂停后，需要手动恢复才能继续使用。终端操作会计入机器活动。</span></div>
+      <div className="bottom-note"><Pause size={15}/><span>开启保活的机器会在时间窗口内自动恢复。终端操作会计入机器活动。</span></div>
     </div></main>
     {toast&&<div className={'toast '+(toast.error?'toast-error':'')} role={toast.error?'alert':'status'}>{toast.error?<CircleAlert size={18}/>:<Check size={18}/>}<span>{toast.text}</span><button className="icon-button" aria-label="关闭提示" onClick={()=>setToast(null)}><X size={16}/></button></div>}
     {form&&<AccountForm current={form==='new'?null:form} close={()=>setForm(null)} saved={reloadAccounts}/>}
-    {detail&&<Details row={latest(detail)} control={control(latest(detail))} close={()=>setDetail(null)} stop={()=>void change(latest(detail),'stop')} busy={submitting.has(detail.machine.id)||busyMap.has(detail.machine.id)} terminal={()=>{setTerminal(latest(detail));setDetail(null);}}/>}
-    {terminal&&<Suspense fallback={<div className="toast" role="status">正在加载终端…</div>}><TerminalPane row={latest(terminal)} control={control(latest(terminal))} onClose={()=>setTerminal(null)}/></Suspense>}
+    {detail&&<Details row={latest(detail)} control={control(latest(detail))} close={()=>setDetail(null)} stop={()=>void change(latest(detail),'stop')} busy={submitting.has(detail.machine.id)||busyMap.has(detail.machine.id)} terminal={()=>{openTerminal(latest(detail));setDetail(null);}}/>}
+    {keepaliveRow&&<KeepaliveForm row={latest(keepaliveRow)} overview={keepalive} close={()=>setKeepaliveRow(null)} saved={value=>{setKeepalive(value);notify('保活设置已保存。');}}/>}
+    {telegramOpen&&<TelegramForm close={()=>setTelegramOpen(false)}/>}
+    {terminals.map((terminal,index)=><Suspense key={terminal.machine.id} fallback={<div className="toast" role="status">正在加载终端…</div>}><TerminalPane row={latest(terminal)} control={control(latest(terminal))} index={index} active={activeTerminal===terminal.machine.id} onActivate={()=>setActiveTerminal(terminal.machine.id)} onClose={()=>setTerminals(current=>current.filter(row=>row.machine.id!==terminal.machine.id))}/></Suspense>)}
     {history&&<Modal title="操作记录" onClose={()=>setHistory(false)} wide><p className="dialog-description">跟踪请求直到完成；刷新页面后仍可继续查看。</p>{!actions.length?<div className="empty"><Activity size={30}/><h3>还没有操作记录</h3></div>:<div className="history-list">{actions.map(a=><div className="history-row" key={a.id}><span className={'history-icon '+a.state}>{pending(a)?<LoaderCircle size={18} className="spin"/>:a.state==='succeeded'?<Check size={18}/>:<CircleAlert size={18}/>}</span><div className="history-body"><strong>{actionLabels[a.type]} · {a.machineName}</strong><small>{accounts.find(x=>x.id===a.accountId)?.label||'已移除账号'} · {new Date(a.createdAt).toLocaleString('zh-CN')}</small>{a.errorMessage&&<p className="history-error">{a.errorMessage}</p>}{a.type==='resume'&&a.processesPreserved===false&&<p className="history-error">机器已重新启动，原来的进程未保留。</p>}</div><div className="history-result"><span>{{submitting:'提交中',queued:'排队中',running:'执行中',succeeded:'已完成',failed:'失败',unknown:'结果待确认'}[a.state]}</span>{a.state==='unknown'&&<button className="button compact" disabled={submitting.has(a.machineId)} onClick={()=>retry(a)}>重试原请求</button>}</div></div>)}</div>}</Modal>}
   </div>;
 }

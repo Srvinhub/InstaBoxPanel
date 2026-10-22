@@ -30,7 +30,10 @@ export class Instabox {
         ...init, redirect: 'manual', signal: AbortSignal.timeout(timeout),
         headers: { 'Accept': 'application/json', 'X-API-Key': this.apiKey, ...init.headers },
       });
-    } catch { throw new PanelError(502, 'upstream_unreachable', '暂时无法连接 InstaBox，操作结果可能尚未确认。', true); }
+    } catch (error) {
+      if (error instanceof PanelError && error.code === 'automation_budget') throw error;
+      throw new PanelError(502, 'upstream_unreachable', '暂时无法连接 InstaBox，操作结果可能尚未确认。', true);
+    }
     if (response.status >= 300 && response.status < 400)
       throw new PanelError(502, 'upstream_redirect', 'InstaBox 返回了非预期跳转，已停止请求。');
     let data: any;

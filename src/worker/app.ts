@@ -4,11 +4,14 @@ import type { ActionType } from '../shared/types';
 import { encryptKey, decryptKey } from './crypto';
 import { accountView, actionView, type AccountRow, type ActionRow } from './db';
 import { PanelError, safeUpstreamMessage } from './errors';
-import { Instabox, machineView, type Fetcher, type UpstreamOperation } from './instabox';
-import { database } from './schema';
+import { Instabox, type Fetcher } from './instabox';
+import { database, ensureDatabase } from './schema';
+import { applyOperation, createAction } from './actions';
+import { keepaliveOverview, saveKeepalive } from './keepalive';
+import { telegramStatus, saveTelegram, removeTelegram, telegramWebhook } from './telegram';
 import { authenticateSession, sessionStatus, setupAdmin, loginAdmin, logoutAdmin, type Identity } from './session';
 
-export interface Env { DB: D1Database; KEY_ENCRYPTION_SECRET?: string; ASSETS: FetcherBinding }
+export interface Env { DB: D1Database; KEY_ENCRYPTION_SECRET?: string; AUTOMATION_SECRET?: string; ASSETS: FetcherBinding }
 interface FetcherBinding { fetch(request: Request): Promise<Response> }
 interface Dependencies {
   fetcher?: Fetcher;
@@ -41,19 +44,6 @@ async function action(db: D1Database, id: string): Promise<ActionRow> {
   if (!row) throw new PanelError(404, 'action_not_found', '操作记录不存在。');
   return row;
 }
-async function applyOperation(db: D1Database, row: ActionRow, op: UpstreamOperation) {
-  if (op.machineId !== row.machine_id || op.type !== row.type)
-    throw new PanelError(502, 'operation_mismatch', '上游操作与请求不一致，结果尚未确认。');
-  const machine = op.machine ? machineView(op.machine) : undefined;
-  const rawCode = op.error?.code;
-  const code = typeof rawCode === 'string' && /^[a-z0-9_]{1,80}$/.test(rawCode) ? rawCode : 'operation_failed';
-  await db.prepare(
-    'UPDATE insb_actions SET operation_id = ?, state = ?, phase = ?, error_code = ?, error_message = ?, processes_preserved = ?, updated_at = ? WHERE id = ? AND state NOT IN (?, ?)'
-  ).bind(op.id, op.state, String(op.phase || '').slice(0, 120),
-    op.state === 'failed' ? code : null, op.state === 'failed' ? safeUpstreamMessage(code) : null,
-    machine?.runtime.processesPreserved === undefined ? null : Number(machine.runtime.processesPreserved),
-    now(), row.id, 'succeeded', 'failed').run();
-}
 
 export function createApp(deps: Dependencies = {}) {
   const app = new Hono<{ Bindings: Env; Variables: { identity: Identity } }>();
@@ -70,7 +60,7 @@ export function createApp(deps: Dependencies = {}) {
     if (!c.req.path.startsWith('/api/')) { await next(); return; }
     if (new URL(c.req.url).protocol !== 'https:')
       throw new PanelError(400, 'https_required', '管理员登录和机器管理需要 HTTPS，请使用 Cloudflare 的 HTTPS 地址。');
-    if (!['GET', 'HEAD', 'OPTIONS'].includes(c.req.method)) {
+    if (!['GET', 'HEAD', 'OPTIONS'].includes(c.req.method) && !(c.req.method === 'POST' && c.req.path === '/api/telegram/webhook')) {
       if (c.req.header('Origin') !== new URL(c.req.url).origin || c.req.header('X-Panel-Request') !== '1')
         throw new PanelError(403, 'csrf_rejected', '请求来源验证失败，请从面板重新操作。');
       if (!c.req.header('Content-Type')?.startsWith('application/json'))
@@ -96,6 +86,7 @@ export function createApp(deps: Dependencies = {}) {
     c.header('Set-Cookie', await logoutAdmin(database(c.env), c.req.raw));
     return c.json({ ok: true });
   });
+  app.post('/api/telegram/webhook', c => telegramWebhook(c.env, c.req.raw, deps.fetcher));
   app.use('/api/*', async (c, next) => {
     const db = database(c.env);
     const identity = deps.authenticate ? await deps.authenticate(c.req.raw, c.env) : await authenticateSession(c.req.raw, db);
@@ -105,6 +96,14 @@ export function createApp(deps: Dependencies = {}) {
   app.get('/api/accounts', async c => {
     const result = await c.env.DB.prepare('SELECT * FROM insb_accounts WHERE deleted_at IS NULL ORDER BY created_at').all<AccountRow>();
     return c.json({ accounts: result.results.map(accountView) });
+  });
+  app.get('/api/keepalive', async c => c.json(await keepaliveOverview(c.env)));
+  app.get('/api/telegram', async c => c.json(await telegramStatus(c.env)));
+  app.put('/api/telegram', async c => c.json(await saveTelegram(c.env, await jsonBody(c.req.raw), new URL(c.req.url).origin, c.get('identity').key, deps.fetcher)));
+  app.delete('/api/telegram', async c => c.json(await removeTelegram(c.env, deps.fetcher)));
+  app.put('/api/accounts/:id/machines/:machineId/keepalive', async c => {
+    const row = await account(c.env.DB, c.req.param('id'), true);
+    return c.json(await saveKeepalive(c.env, row, validId(c.req.param('machineId')), await jsonBody(c.req.raw), c.get('identity').key, deps.fetcher));
   });
   app.post('/api/accounts', async c => {
     const body = await c.req.json().catch(() => { throw new PanelError(400, 'invalid_json', '请求 JSON 无效。'); });
@@ -153,7 +152,16 @@ export function createApp(deps: Dependencies = {}) {
     const pending = await c.env.DB.prepare("SELECT id FROM insb_actions WHERE account_id = ? AND state IN ('submitting','queued','running','unknown') LIMIT 1").bind(row.id).first();
     if (pending) throw new PanelError(409, 'pending_actions', '请先等待或确认这个账号的未完成操作，再移除账号。');
     // Keep the audit trail, erase the credential, never call DELETE on InstaBox.
-    await c.env.DB.prepare("UPDATE insb_accounts SET deleted_at=?,updated_at=?,enabled=0,key_ciphertext='',key_iv='',key_suffix='' WHERE id=?").bind(now(), now(), row.id).run();
+    await ensureDatabase(c.env.DB);
+    const removed = await c.env.DB.batch([
+      c.env.DB.prepare(`UPDATE insb_accounts SET deleted_at=?,updated_at=?,enabled=0,key_ciphertext='',key_iv='',key_suffix=''
+        WHERE id=? AND deleted_at IS NULL AND NOT EXISTS
+        (SELECT id FROM insb_actions WHERE account_id=? AND state IN ('submitting','queued','running','unknown'))`).bind(now(), now(), row.id, row.id),
+      c.env.DB.prepare(`UPDATE insb_keepalive SET mode='off',version=version+1,last_result='账号已移除',last_error=''
+        WHERE account_id=? AND EXISTS(SELECT id FROM insb_accounts WHERE id=? AND deleted_at IS NOT NULL)`).bind(row.id, row.id),
+      c.env.DB.prepare('DELETE FROM insb_machine_watch WHERE account_id=? AND EXISTS(SELECT id FROM insb_accounts WHERE id=? AND deleted_at IS NOT NULL)').bind(row.id, row.id),
+    ]);
+    if (!removed[0].meta.changes) throw new PanelError(409, 'pending_actions', '账号有新提交的未完成操作，请先确认结果后再移除。');
     return c.json({ ok: true });
   });
   app.get('/api/accounts/:id/machines', async c => {
@@ -228,13 +236,9 @@ export function createApp(deps: Dependencies = {}) {
       const machine = await remote.machine(machineId);
       if (type === 'stop' && machine.state === 'suspended')
         throw new PanelError(409, 'invalid_state', '暂停中的机器不能直接停止，请先恢复。');
-      const timestamp = now();
-      const inserted = await c.env.DB.prepare('INSERT OR IGNORE INTO insb_actions (id,account_id,machine_id,machine_name,type,state,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)')
-        .bind(body.requestId, row.id, machineId, machine.name, type, 'submitting', timestamp, timestamp).run();
-      record = await action(c.env.DB, body.requestId);
-      if (record.account_id !== row.id || record.machine_id !== machineId || record.type !== type)
-        throw new PanelError(409, 'idempotency_conflict', '请求标识冲突。');
-      if (!inserted.meta.changes) return c.json({ action: actionView(record) }, 202);
+      const result = await createAction(c.env.DB, row.id, machine, type, body.requestId);
+      record = result.action;
+      if (!result.created) return c.json({ action: actionView(record) }, 202);
     } else {
       const claimed = await c.env.DB.prepare("UPDATE insb_actions SET state='submitting',updated_at=?,error_code=NULL,error_message=NULL WHERE id=? AND operation_id IS NULL AND (state='unknown' OR (state='submitting' AND updated_at < ?))")
         .bind(now(), record.id, new Date(Date.now() - 30000).toISOString()).run();

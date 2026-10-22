@@ -38,6 +38,26 @@ try{
   await page.locator('dialog').getByRole('button',{name:'停止机器…',exact:true}).click();await page.getByText('确认结束这台机器上的所有进程？',{exact:true}).waitFor();
   await page.locator('dialog').getByRole('button',{name:'取消',exact:true}).click();await page.locator('dialog').getByRole('button',{name:'关闭',exact:true}).click();
   step('machine detail and stop confirmation');
+  await page.getByRole('button',{name:'设置 development 保活',exact:true}).click();
+  assert.equal(await page.locator('input[name="keepalive-mode"][value="off"]').isChecked(),true);
+  await page.locator('input[name="keepalive-mode"][value="always"]').check();await page.getByRole('button',{name:'保存保活设置',exact:true}).click();
+  await dev.locator('.keepalive-button.enabled').waitFor();assert.equal(await dev.locator('.keepalive-button.enabled').count(),1);
+  await page.getByRole('button',{name:'设置 development 保活',exact:true}).click();await page.locator('input[name="keepalive-mode"][value="windows"]').check();
+  for(let index=1;index<5;index++)await page.getByRole('button',{name:/添加时间范围/}).click();
+  assert.equal(await page.getByRole('button',{name:/添加时间范围/}).isDisabled(),true);
+  const ranges=[['22:00','06:00'],['08:00','09:00'],['10:00','11:00'],['12:00','13:00'],['14:00','15:00']];
+  for(const [index,range] of ranges.entries()){await page.getByLabel('时间范围 '+(index+1)+' 开始',{exact:true}).fill(range[0]);await page.getByLabel('时间范围 '+(index+1)+' 结束',{exact:true}).fill(range[1]);}
+  await page.getByRole('button',{name:'保存保活设置',exact:true}).click();await page.getByRole('button',{name:'设置 development 保活',exact:true}).click();
+  assert.equal(await page.locator('.keepalive-window').count(),5);assert.equal(await page.getByLabel('时间范围 1 开始',{exact:true}).inputValue(),'22:00');
+  await page.locator('input[name="keepalive-mode"][value="off"]').check();await page.getByRole('button',{name:'保存保活设置',exact:true}).click();
+  step('keepalive defaults off, persists all-day and five daily windows, and can be disabled');
+  await page.getByRole('button',{name:'Telegram 设置',exact:true}).click();await page.getByLabel('私人聊天 ID',{exact:true}).waitFor();
+  assert.equal(await page.getByRole('checkbox',{name:/机器离线时通知我/}).isChecked(),false);
+  await page.getByLabel('Bot Token',{exact:true}).fill('123456789:demo_token_not_sent_to_telegram');await page.getByLabel('私人聊天 ID',{exact:true}).fill('12345678');
+  await page.getByRole('button',{name:'绑定机器人',exact:true}).click();await page.getByText(/已绑定 @instabox_demo_bot/).waitFor();
+  await page.getByRole('checkbox',{name:/机器离线时通知我/}).check();await page.getByRole('button',{name:'保存机器人设置',exact:true}).click();
+  await page.getByRole('button',{name:'解除绑定',exact:true}).click();await page.getByRole('button',{name:'确认解除绑定',exact:true}).click();await page.getByRole('button',{name:'绑定机器人',exact:true}).waitFor();
+  await page.locator('dialog').getByRole('button',{name:'关闭',exact:true}).click();step('Telegram binding, default-off notifications, settings, and disconnect');
   await page.getByRole('button',{name:'打开 development 终端',exact:true}).click();await page.locator('.terminal-dialog').waitFor();
   const terminal=page.locator('.xterm-helper-textarea');await terminal.waitFor();await terminal.focus();await terminal.pressSequentially('ls');await terminal.press('Enter');
   await page.waitForFunction(()=>document.querySelector('.xterm-rows')?.textContent?.includes('README.md'));
@@ -46,6 +66,26 @@ try{
   await page.screenshot({path:path.join(output,'terminal-desktop.png')});
   await page.getByRole('button',{name:'重新连接终端',exact:true}).click();await page.waitForFunction(()=>document.querySelector('.xterm-rows')?.textContent?.includes('InstaBox Panel'));
   await page.getByRole('button',{name:'关闭终端',exact:true}).click();step('terminal ANSI output, keyboard input, Esc, and reconnect');
+  await page.getByRole('button',{name:'打开 development 终端',exact:true}).click();await page.getByRole('button',{name:'打开 personal-workspace 终端',exact:true}).click();
+  const firstWindow=page.getByRole('dialog',{name:'development',exact:true}),secondWindow=page.getByRole('dialog',{name:'personal-workspace',exact:true});
+  await secondWindow.locator('.xterm-helper-textarea').waitFor();assert.equal(await page.locator('.floating-terminal').count(),2);
+  await secondWindow.getByRole('button',{name:'最大化终端窗口',exact:true}).click();assert.equal(Math.round((await secondWindow.boundingBox()).width),1440);
+  assert.equal(await page.evaluate(()=>document.fullscreenElement===null),true);
+  await secondWindow.getByRole('button',{name:'还原终端窗口',exact:true}).click();
+  const original=await secondWindow.boundingBox();const title=await secondWindow.locator('h2').boundingBox();
+  await page.mouse.move(title.x+10,title.y+8);await page.mouse.down();await page.mouse.move(title.x+70,title.y+58,{steps:8});await page.mouse.up();
+  const moved=await secondWindow.boundingBox();assert.ok(moved.x>original.x+40&&moved.y>original.y+30,'terminal moves by its title');
+  const handle=await secondWindow.locator('.terminal-resize').boundingBox();
+  await page.mouse.move(handle.x+15,handle.y+15);await page.mouse.down();await page.mouse.move(handle.x-140,handle.y-100,{steps:8});await page.mouse.up();
+  const resized=await secondWindow.boundingBox();assert.ok(resized.width<moved.width-100&&resized.height<moved.height-80,'terminal resizes by its handle');
+  const secondInput=secondWindow.locator('.xterm-helper-textarea');await secondInput.focus();await secondInput.pressSequentially('pwd');await secondInput.press('Enter');
+  await secondWindow.getByText('/data/home/workspace',{exact:false}).first().waitFor();
+  await page.getByRole('button',{name:'打开 development 终端',exact:true}).click();assert.equal(await page.locator('.floating-terminal').count(),2);
+  await firstWindow.getByRole('button',{name:'关闭终端',exact:true}).click();assert.equal(await secondWindow.isVisible(),true);
+  await page.getByRole('textbox',{name:'搜索机器'}).click();await page.getByRole('textbox',{name:'搜索机器'}).fill('development');assert.equal(await page.locator('.machines tbody tr').count(),1);
+  await page.getByRole('textbox',{name:'搜索机器'}).fill('');
+  await page.screenshot({path:path.join(output,'terminal-floating-desktop.png')});
+  await secondWindow.getByRole('button',{name:'关闭终端',exact:true}).click();step('multiple nonmodal terminals move, resize, maximize, retain independent sessions, and allow dashboard interaction');
   await page.locator('.page-heading').getByRole('button',{name:'添加账号',exact:true}).click();
   await page.getByLabel('账号别名',{exact:true}).fill('测试失效账号');await page.getByLabel('API Key',{exact:true}).fill('ibk_demo_error');await page.getByRole('button',{name:'保存账号',exact:true}).click();
   await page.locator('.account-error').filter({hasText:'测试失效账号'}).waitFor();assert.equal(await page.locator('.machines tbody tr').count(),5);
@@ -57,8 +97,8 @@ try{
   await page.getByRole('combobox',{name:'当前账号'}).selectOption('all');assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),'mobile horizontal overflow');
   await page.screenshot({path:path.join(output,'dashboard-mobile.png'),fullPage:true});
   await page.getByRole('button',{name:'打开 development 终端',exact:true}).click();await page.locator('.xterm-helper-textarea').waitFor();assert.ok(await page.evaluate(()=>document.querySelector('.terminal-dialog').getBoundingClientRect().width<=innerWidth));
-  await page.screenshot({path:path.join(output,'terminal-mobile.png')});await page.getByRole('button',{name:'关闭终端',exact:true}).click();step('mobile selection, dashboard layout, and terminal');
-  await page.getByRole('button',{name:'退出登录',exact:true}).filter({visible:true}).click();await page.getByRole('heading',{name:'登录私人控制台',exact:true}).waitFor();assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));await page.screenshot({path:path.join(output,'login-mobile.png')});step('mobile logout and login layout');
+  await page.screenshot({path:path.join(output,'terminal-mobile.png')});step('mobile selection, dashboard layout, and terminal');
+  await page.getByRole('button',{name:'退出登录',exact:true}).filter({visible:true}).click();await page.getByRole('heading',{name:'登录私人控制台',exact:true}).waitFor();assert.equal(await page.locator('.floating-terminal').count(),0);assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));await page.screenshot({path:path.join(output,'login-mobile.png')});step('mobile logout closes terminals and preserves login layout');
   assert.deepEqual(failures,[],'browser errors');await writeFile(path.join(output,'browser-report.json'),JSON.stringify({passed:steps,errors:failures},null,2)+'\n');console.log('Browser checks passed: '+steps.length);
 }catch(error){if(browser){const page=browser.contexts()[0]?.pages()[0];if(page)await page.screenshot({path:path.join(output,'failure.png'),fullPage:true}).catch(()=>{});}console.error(error);process.exitCode=1;}
 finally{await browser?.close();child.kill();}
