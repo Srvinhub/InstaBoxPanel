@@ -139,7 +139,7 @@ async function submitAction(env: AutomationEnv, account: AccountRow, remote: Ins
   if (!action) {
     if (machine.state !== (type === 'resume' ? 'suspended' : 'running') || machine.operationId)
       return '机器当前为“' + stateLabels[machine.state] + '”，无需执行该命令。停止的机器请先在面板启动。';
-    action = (await createAction(env.DB, account.id, machine, type, requestId)).action;
+    action = (await createAction(env.DB, account.id, machine, type, requestId, 'telegram')).action;
   }
   if (!action || action.account_id !== account.id || action.machine_id !== machine.id || action.type !== type)
     throw new PanelError(409, 'idempotency_conflict', '请求标识冲突，请重新发送命令。');
@@ -205,6 +205,7 @@ export async function telegramWebhook(env: AutomationEnv, request: Request, fetc
       message.chat?.type !== 'private' || String(message.chat.id) !== bot.chat_id || String(message.from?.id) !== bot.chat_id ||
       message.from?.is_bot || typeof message.text !== 'string' || !message.text.startsWith('/') || message.text.length > 1000)
     return Response.json({ ok: true });
+  await ensureDatabase(db);
   const timestamp = Date.now();
   let entry = await db.prepare('SELECT request_id,status FROM insb_telegram_updates WHERE update_id=?').bind(update.update_id).first<{ request_id: string; status: string }>();
   if (!entry) {

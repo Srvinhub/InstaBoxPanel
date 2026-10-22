@@ -3,6 +3,7 @@ import authSql from '../../migrations/0002_auth.sql';
 import keepaliveSql from '../../migrations/0003_keepalive.sql';
 import telegramSql from '../../migrations/0004_telegram.sql';
 import automationKeysSql from '../../migrations/0005_automation_keys.sql';
+import actionSourcesSql from '../../migrations/0006_action_sources.sql';
 import { PanelError } from './errors';
 
 const migrations = [
@@ -11,6 +12,7 @@ const migrations = [
   { name: '0003_keepalive.sql', sql: keepaliveSql },
   { name: '0004_telegram.sql', sql: telegramSql },
   { name: '0005_automation_keys.sql', sql: automationKeysSql },
+  { name: '0006_action_sources.sql', sql: actionSourcesSql },
 ];
 const initialization = new WeakMap<object, Promise<void>>();
 
@@ -52,6 +54,7 @@ export async function ensureDatabase(db: D1Database): Promise<void> {
       (SELECT id FROM insb_admin WHERE id = 1) AS admin_id,
       (SELECT id FROM insb_accounts LIMIT 1) AS account_id,
       (SELECT id FROM insb_actions LIMIT 1) AS action_id,
+      (SELECT action_id FROM insb_action_sources LIMIT 1) AS action_source_id,
       (SELECT token_hash FROM insb_sessions LIMIT 1) AS session_id,
       (SELECT bucket FROM insb_login_limits LIMIT 1) AS rate_id,
       (SELECT machine_id FROM insb_keepalive LIMIT 1) AS keepalive_id,

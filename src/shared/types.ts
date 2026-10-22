@@ -2,6 +2,7 @@ export const machineStates = ['creating', 'starting', 'running', 'stopping', 'st
 export type MachineState = typeof machineStates[number];
 export type ActionType = 'suspend' | 'resume' | 'start' | 'stop';
 export type ActionState = 'submitting' | 'queued' | 'running' | 'succeeded' | 'failed' | 'unknown';
+export type ActionSource = 'web' | 'telegram' | 'keepalive' | 'unknown';
 export interface Account {
   id: string; label: string; userId: string; login: string; email: string;
   keySuffix: string; enabled: boolean; createdAt: string; updatedAt: string;
@@ -18,7 +19,7 @@ export interface AccountMachines {
 }
 export interface Action {
   id: string; accountId: string; machineId: string; machineName: string;
-  type: ActionType; state: ActionState; operationId: string | null; phase: string;
+  type: ActionType; source: ActionSource; state: ActionState; operationId: string | null; phase: string;
   errorCode: string | null; errorMessage: string | null;
   createdAt: string; updatedAt: string; processesPreserved: boolean | null;
 }
@@ -31,4 +32,7 @@ export const stateLabels: Record<MachineState, string> = {
 };
 export const actionLabels: Record<ActionType, string> = {
   suspend: '暂停', resume: '恢复', start: '启动', stop: '停止',
+};
+export const actionSourceLabels: Record<ActionSource, string> = {
+  web: '来自 Web', telegram: '来自 TG', keepalive: '来自保活定时器', unknown: '历史记录，来源未记录',
 };

@@ -1,21 +1,28 @@
-import { type ActionRow } from './db';
-import type { ActionType, Machine } from '../shared/types';
+import { actionRow, type ActionRow } from './db';
+import type { ActionSource, ActionType, Machine } from '../shared/types';
 import { PanelError, safeUpstreamMessage } from './errors';
 import { machineView, type UpstreamOperation } from './instabox';
 
-export async function createAction(db: D1Database, accountId: string, machine: Machine, type: ActionType, requestId: string) {
+export function actionSourceStatement(db: D1Database, requestId: string, source: Exclude<ActionSource, 'unknown'>) {
+  return db.prepare('INSERT OR IGNORE INTO insb_action_sources (action_id,source) SELECT ?,? WHERE changes()>0')
+    .bind(requestId, source);
+}
+
+export async function createAction(db: D1Database, accountId: string, machine: Machine, type: ActionType, requestId: string, source: Exclude<ActionSource, 'unknown'> = 'web') {
   const timestamp = new Date().toISOString();
-  const inserted = await db.prepare(`INSERT OR IGNORE INTO insb_actions
+  const inserted = await db.batch([db.prepare(`INSERT OR IGNORE INTO insb_actions
     (id,account_id,machine_id,machine_name,type,state,created_at,updated_at)
     SELECT ?,a.id,?,?,?,'submitting',?,? FROM insb_accounts a
     WHERE a.id=? AND a.enabled=1 AND a.deleted_at IS NULL AND NOT EXISTS
     (SELECT id FROM insb_actions WHERE machine_id=? AND state IN ('submitting','queued','running','unknown'))`)
-    .bind(requestId, machine.id, machine.name, type, timestamp, timestamp, accountId, machine.id).run();
-  const action = await db.prepare('SELECT * FROM insb_actions WHERE id=?').bind(requestId).first<ActionRow>();
+    .bind(requestId, machine.id, machine.name, type, timestamp, timestamp, accountId, machine.id),
+    actionSourceStatement(db, requestId, source),
+  ]);
+  const action = await actionRow(db, requestId);
   if (!action) throw new PanelError(409, 'pending_actions', '机器仍有未完成或结果待确认的操作，或账号已停用，请检查状态后重试。');
   if (action.account_id !== accountId || action.machine_id !== machine.id || action.type !== type)
     throw new PanelError(409, 'idempotency_conflict', '请求标识已经用于另一个操作。');
-  return { action, created: Boolean(inserted.meta.changes) };
+  return { action, created: Boolean(inserted[0].meta.changes) };
 }
 
 export async function applyOperation(db: D1Database, row: ActionRow, operation: UpstreamOperation) {

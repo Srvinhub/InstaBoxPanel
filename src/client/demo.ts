@@ -94,7 +94,7 @@ export async function demoRequest(path: string, options: { method?: string; body
     if (!m) throw new ApiError('not_found', '机器不存在。');
     const type = body.type as ActionType;
     const record: Action = { id: body.requestId, accountId: change[1], machineId: m.id, machineName: m.name, type,
-      state: 'running', operationId: 'op_' + body.requestId, phase: 'waiting_ready', errorCode: null, errorMessage: null,
+      source: 'web', state: 'running', operationId: 'op_' + body.requestId, phase: 'waiting_ready', errorCode: null, errorMessage: null,
       processesPreserved: null, createdAt: stamp(), updatedAt: stamp() };
     actions.unshift(record);
     m.state = { suspend: 'suspending', resume: 'resuming', start: 'starting', stop: 'stopping' }[type] as Machine['state'];

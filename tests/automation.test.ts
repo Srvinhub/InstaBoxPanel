@@ -7,6 +7,7 @@ import { ensureDatabase } from '../src/worker/schema';
 import { encryptKey, decryptKey } from '../src/worker/crypto';
 import { automationDataKey, enableAutomation } from '../src/worker/automation';
 import { createAction } from '../src/worker/actions';
+import { actionRow, actionView } from '../src/worker/db';
 import { runAutomation } from '../src/worker/scheduler';
 import { checkTelegramNotifications } from '../src/worker/telegram';
 import { validateSchedule, inKeepaliveWindow } from '../src/shared/keepalive';
@@ -166,6 +167,8 @@ test('keepalive runs with only D1, automatically managed keys, state checks and 
       await Promise.all([runAutomation(env, tick, fixtureState.fetcher), runAutomation(env, tick, fixtureState.fetcher)]);
       assert.equal(operations.size, 1);
       assert.deepEqual(calls.filter(value => value.method === 'POST').map(value => value.path), ['/v1/machines/machine-1/resume']);
+      const audit = (await call('/api/actions')).body.actions;
+      assert.equal(audit.length, 1); assert.equal(audit[0].source, 'keepalive');
       const failed = await db.prepare('SELECT last_error FROM insb_keepalive WHERE machine_id=?').bind('machine-4').first<any>();
       assert.ok(failed.last_error);
       control.failMachine = '';
@@ -182,6 +185,7 @@ test('keepalive runs with only D1, automatically managed keys, state checks and 
       await run();
       assert.equal(operations.size, count);
       assert.equal(calls.filter(value => value.idempotency === 'panel-' + action.id).length, 2);
+      assert.equal((await call('/api/actions/' + action.id)).body.action.source, 'keepalive');
       await run();
     });
     await context.test('disabling a policy during a status query prevents resume, and disabled accounts are skipped', async () => {
@@ -250,6 +254,7 @@ test('Telegram commands and offline notifications are private, authenticated and
       const delivered = messages.length;
       await webhook(7, '/resume account-a machine-0');
       assert.equal(operations.size, 1); assert.equal(messages.length, delivered);
+      assert.equal((await call('/api/actions')).body.actions[0].source, 'telegram');
       await webhook(8, '/status account-a machine-0');
       assert.ok(messages.at(-1)!.includes('运行中'));
       control.failTelegram = true;
@@ -443,6 +448,94 @@ test('Telegram settings preserve offline deduplication and fail closed if webhoo
       env.DB = db;
       assert.equal((await call('/api/telegram', 'PUT', { botToken, chatId, notifyOffline: false })).status, 200);
       assert.equal((await webhook(2, '/accounts')).status, 200);
+    } finally { await fixtureState.runtime.dispose(); }
+  });
+});
+
+test('machine action sources are durable, cannot be spoofed by web requests and preserve legacy audit rows', async context => {
+  await context.test('the unified action list includes web, Telegram and keepalive operations with their original sources', async () => {
+    const fixtureState = await fixture();
+    const { call, webhook, setPolicy, run, machines } = fixtureState;
+    try {
+      const webId = crypto.randomUUID();
+      const response = await call('/api/accounts/account-a/machines/machine-0/actions', 'POST', { type: 'suspend', requestId: webId, source: 'keepalive' });
+      assert.equal(response.status, 202); assert.equal(response.body.action.source, 'web');
+      await call('/api/telegram', 'PUT', { botToken, chatId, notifyOffline: false });
+      machines.get('machine-1')!.state = 'suspended';
+      assert.equal((await webhook(1, '/resume account-a machine-1')).status, 200);
+      await setPolicy('machine-2'); machines.get('machine-2')!.state = 'suspended';
+      await run();
+      const audit = (await call('/api/actions')).body.actions;
+      assert.equal(audit.length, 3);
+      assert.deepEqual(audit.map((action: any) => action.source).sort(), ['keepalive', 'telegram', 'web']);
+      for (const action of audit) assert.equal((await call('/api/actions/' + action.id)).body.action.source, action.source);
+      const stable = (await call('/api/actions')).body.actions;
+      assert.equal(stable.length, 3); assert.ok(stable.every((action: any) => action.state === 'succeeded'));
+      await run(); assert.equal((await call('/api/actions')).body.actions.length, 3);
+    } finally { await fixtureState.runtime.dispose(); }
+  });
+  await context.test('web retries of uncertain Telegram and keepalive actions retain their original audit sources', async () => {
+    const fixtureState = await fixture();
+    const { call, webhook, setPolicy, run, control, machines, operations } = fixtureState;
+    try {
+      await call('/api/telegram', 'PUT', { botToken, chatId, notifyOffline: false });
+      machines.get('machine-0')!.state = 'suspended'; control.loseReply = true;
+      await webhook(1, '/resume account-a machine-0');
+      const telegram = (await call('/api/actions')).body.actions[0];
+      assert.equal(telegram.source, 'telegram'); assert.equal(telegram.state, 'unknown');
+      const retried = await call('/api/accounts/account-a/machines/machine-0/actions', 'POST', { type: 'resume', requestId: telegram.id, source: 'web' });
+      assert.equal(retried.body.action.source, 'telegram'); assert.equal(operations.size, 1);
+      await setPolicy('machine-1'); machines.get('machine-1')!.state = 'suspended'; control.loseReply = true;
+      await run();
+      const keepalive = (await call('/api/actions')).body.actions.find((action: any) => action.machineId === 'machine-1');
+      assert.equal(keepalive.source, 'keepalive'); assert.equal(keepalive.state, 'unknown');
+      const restored = await call('/api/accounts/account-a/machines/machine-1/actions', 'POST', { type: 'resume', requestId: keepalive.id });
+      assert.equal(restored.body.action.source, 'keepalive'); assert.equal(operations.size, 2);
+    } finally { await fixtureState.runtime.dispose(); }
+  });
+  await context.test('duplicate action identifiers do not overwrite a recorded source or invent a source for old audit rows', async () => {
+    const fixtureState = await fixture();
+    const { db, call, machines } = fixtureState;
+    try {
+      const requestId = crypto.randomUUID(), current = machines.get('machine-0')!;
+      await createAction(db, 'account-a', current, 'suspend', requestId, 'telegram');
+      const duplicate = await createAction(db, 'account-a', current, 'suspend', requestId, 'web');
+      assert.equal(duplicate.created, false); assert.equal(duplicate.action.source, 'telegram');
+      await db.prepare('DELETE FROM insb_action_sources WHERE action_id=?').bind(requestId).run();
+      const legacy = await createAction(db, 'account-a', current, 'suspend', requestId, 'keepalive');
+      assert.equal(legacy.created, false); assert.equal(actionView(legacy.action).source, 'unknown');
+      assert.equal((await call('/api/actions/' + requestId)).body.action.source, 'unknown');
+      assert.equal((await db.prepare('SELECT COUNT(*) AS total FROM insb_action_sources').first<any>()).total, 0);
+    } finally { await fixtureState.runtime.dispose(); }
+  });
+  await context.test('a missing source table is created on an authenticated history request without changing old actions', async () => {
+    const fixtureState = await fixture();
+    const { db, call, machines } = fixtureState;
+    try {
+      const requestId = crypto.randomUUID();
+      await createAction(db, 'account-a', machines.get('machine-0')!, 'suspend', requestId);
+      const previous = await db.prepare('SELECT * FROM insb_actions WHERE id=?').bind(requestId).first();
+      await db.prepare('DROP TABLE insb_action_sources').run();
+      await db.prepare("DELETE FROM insb_d1_migrations WHERE name='0006_action_sources.sql'").run();
+      const history = await call('/api/actions');
+      assert.equal(history.status, 200); assert.equal(history.body.actions[0].source, 'unknown');
+      assert.deepEqual(await db.prepare('SELECT * FROM insb_actions WHERE id=?').bind(requestId).first(), previous);
+      assert.ok(await db.prepare("SELECT name FROM insb_d1_migrations WHERE name='0006_action_sources.sql'").first());
+    } finally { await fixtureState.runtime.dispose(); }
+  });
+  await context.test('concurrent actions store exactly one source matching the accepted request', async () => {
+    const fixtureState = await fixture();
+    const { db, machines } = fixtureState;
+    try {
+      const current = machines.get('machine-0')!, requestId = crypto.randomUUID();
+      const results = await Promise.all([
+        createAction(db, 'account-a', current, 'suspend', requestId, 'web'),
+        createAction(db, 'account-a', current, 'suspend', requestId, 'telegram'),
+      ]);
+      assert.equal(results.filter(result => result.created).length, 1);
+      const source = results.find(result => result.created)!.action.source;
+      assert.equal((await actionRow(db, requestId))!.source, source);
+      assert.equal((await db.prepare('SELECT COUNT(*) AS total FROM insb_action_sources').first<any>()).total, 1);
     } finally { await fixtureState.runtime.dispose(); }
   });
 });

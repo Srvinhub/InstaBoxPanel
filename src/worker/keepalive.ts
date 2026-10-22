@@ -3,7 +3,7 @@ import { decryptKey } from './crypto';
 import { type AccountRow, type ActionRow } from './db';
 import { PanelError } from './errors';
 import { Instabox, type Fetcher } from './instabox';
-import { applyOperation } from './actions';
+import { actionSourceStatement, applyOperation } from './actions';
 import { database, ensureDatabase } from './schema';
 import { enableAutomation, migrateAutomation, type AutomationEnv } from './automation';
 
@@ -111,6 +111,7 @@ async function runPolicy(env: KeepaliveEnv, row: PolicyRow, dataKey: string, fet
           JOIN insb_accounts a ON a.id=k.account_id WHERE k.machine_id=? AND k.version=? AND k.mode<>'off'
           AND a.enabled=1 AND a.deleted_at IS NULL AND NOT EXISTS
           (SELECT id FROM insb_actions WHERE machine_id=k.machine_id AND state IN ('submitting','queued','running','unknown'))`).bind(requestId, stamp, stamp, row.machine_id, row.version),
+        actionSourceStatement(db, requestId, 'keepalive'),
         db.prepare('UPDATE insb_keepalive SET action_id=? WHERE machine_id=? AND version=? AND EXISTS(SELECT id FROM insb_actions WHERE id=?)')
           .bind(requestId, row.machine_id, row.version, requestId),
       ]);

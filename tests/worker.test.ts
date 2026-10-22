@@ -91,11 +91,11 @@ test('account and lifecycle API uses real D1, complete pagination, and durable i
     });
     await t.test('accepted operations stay pending, retries are deduplicated, and payload collisions are refused',async()=>{
       const id=crypto.randomUUID(),path='/api/accounts/'+a.id+'/machines/m_a/actions';
-      const r=await call(path,'POST',{type:'resume',requestId:id});assert.equal(r.status,202);assert.equal(r.body.action.state,'queued');
+      const r=await call(path,'POST',{type:'resume',requestId:id,source:'telegram'});assert.equal(r.status,202);assert.equal(r.body.action.state,'queued');assert.equal(r.body.action.source,'web');
       await call(path,'POST',{type:'resume',requestId:id});assert.equal(effects,1);
       assert.equal((await call(path,'POST',{type:'stop',requestId:id})).status,409);
       assert.equal((await call('/api/actions/'+id+'?wait=0')).body.action.state,'running');
-      complete=true;assert.equal((await call('/api/actions/'+id)).body.action.state,'succeeded');complete=false;
+      complete=true;const completed=(await call('/api/actions/'+id)).body.action;assert.equal(completed.state,'succeeded');assert.equal(completed.source,'web');complete=false;
       assert.equal((await call('/api/accounts/'+a.id+'/machines/m_a2/actions','POST',{type:'delete',requestId:crypto.randomUUID()})).status,400);
     });
     await t.test('a lost POST response is recovered using the same persisted upstream idempotency key',async()=>{

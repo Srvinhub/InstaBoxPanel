@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
 import type { ActionType } from '../shared/types';
 import { encryptKey, decryptKey } from './crypto';
-import { accountView, actionView, type AccountRow, type ActionRow } from './db';
+import { accountView, actionRow, actionView, type AccountRow, type ActionRow } from './db';
 import { PanelError, safeUpstreamMessage } from './errors';
 import { Instabox, type Fetcher } from './instabox';
 import { database, ensureDatabase } from './schema';
@@ -40,7 +40,7 @@ async function account(db: D1Database, id: string, allowDisabled = false): Promi
   return row;
 }
 async function action(db: D1Database, id: string): Promise<ActionRow> {
-  const row = await db.prepare('SELECT * FROM insb_actions WHERE id = ?').bind(validId(id)).first<ActionRow>();
+  const row = await actionRow(db, validId(id));
   if (!row) throw new PanelError(404, 'action_not_found', '操作记录不存在。');
   return row;
 }
@@ -208,11 +208,16 @@ export function createApp(deps: Dependencies = {}) {
     return new Response(null, { status: 101, webSocket: response.webSocket });
   });
   app.get('/api/actions', async c => {
+    await ensureDatabase(c.env.DB);
     // Include all unresolved actions, even when more recent completed actions exist.
-    const rows = await c.env.DB.prepare("SELECT * FROM insb_actions WHERE state IN ('submitting','queued','running','unknown') UNION SELECT * FROM (SELECT * FROM insb_actions ORDER BY created_at DESC LIMIT 50) ORDER BY created_at DESC").all<ActionRow>();
+    const rows = await c.env.DB.prepare(`SELECT a.*,s.source FROM (
+      SELECT * FROM insb_actions WHERE state IN ('submitting','queued','running','unknown')
+      UNION SELECT * FROM (SELECT * FROM insb_actions ORDER BY created_at DESC LIMIT 50)
+      ) a LEFT JOIN insb_action_sources s ON s.action_id=a.id ORDER BY a.created_at DESC`).all<ActionRow>();
     return c.json({ actions: rows.results.map(actionView) });
   });
   app.post('/api/accounts/:id/machines/:machineId/actions', async c => {
+    await ensureDatabase(c.env.DB);
     const row = await account(c.env.DB, c.req.param('id'));
     const machineId = validId(c.req.param('machineId'));
     const body = await c.req.json().catch(() => null);
@@ -220,7 +225,7 @@ export function createApp(deps: Dependencies = {}) {
         typeof body.requestId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(body.requestId))
       throw new PanelError(400, 'invalid_action', '操作类型或请求标识无效。');
     const type = body.type as ActionType;
-    let record = await c.env.DB.prepare('SELECT * FROM insb_actions WHERE id=?').bind(body.requestId).first<ActionRow>();
+    let record = await actionRow(c.env.DB, body.requestId);
     if (record && (record.account_id !== row.id || record.machine_id !== machineId || record.type !== type))
       throw new PanelError(409, 'idempotency_conflict', '这个请求标识已经用于另一个操作。');
     if (record) {
@@ -236,7 +241,7 @@ export function createApp(deps: Dependencies = {}) {
       const machine = await remote.machine(machineId);
       if (type === 'stop' && machine.state === 'suspended')
         throw new PanelError(409, 'invalid_state', '暂停中的机器不能直接停止，请先恢复。');
-      const result = await createAction(c.env.DB, row.id, machine, type, body.requestId);
+      const result = await createAction(c.env.DB, row.id, machine, type, body.requestId, 'web');
       record = result.action;
       if (!result.created) return c.json({ action: actionView(record) }, 202);
     } else {
@@ -255,6 +260,7 @@ export function createApp(deps: Dependencies = {}) {
     return c.json({ action: actionView(await action(c.env.DB, record.id)) }, 202);
   });
   app.get('/api/actions/:id', async c => {
+    await ensureDatabase(c.env.DB);
     const record = await action(c.env.DB, c.req.param('id'));
     if (record.operation_id && activeStates.includes(record.state)) {
       const row = await account(c.env.DB, record.account_id, true);

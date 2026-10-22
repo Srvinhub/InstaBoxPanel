@@ -34,6 +34,11 @@ try{
   await dev.getByRole('button',{name:'暂停',exact:true}).click();await dev.locator('.state-badge').filter({hasText:'已暂停'}).waitFor({timeout:10000});
   await dev.getByRole('button',{name:'恢复',exact:true}).click();await dev.locator('.state-badge').filter({hasText:'运行中'}).waitFor({timeout:10000});
   step('pause and resume wait for completion');
+  await page.getByRole('button',{name:/操作记录/}).click();
+  await page.locator('dialog .history-origin').first().waitFor();
+  assert.equal(await page.locator('dialog .history-origin').count(),2);
+  assert.ok((await page.locator('dialog .history-origin').allTextContents()).every(text=>text==='操作备注：来自 Web'));
+  await page.locator('dialog').getByRole('button',{name:'关闭',exact:true}).click();step('operation history displays the web source note');
   await page.getByRole('button',{name:'查看 development 详情',exact:true}).click();await page.locator('dialog').getByText('空闲自动暂停',{exact:true}).waitFor();
   await page.locator('dialog').getByRole('button',{name:'停止机器…',exact:true}).click();await page.getByText('确认结束这台机器上的所有进程？',{exact:true}).waitFor();
   await page.locator('dialog').getByRole('button',{name:'取消',exact:true}).click();await page.locator('dialog').getByRole('button',{name:'关闭',exact:true}).click();

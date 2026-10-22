@@ -1,7 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type FormEvent } from 'react';
 import { Activity, ArrowUpRight, Box, Check, ChevronRight, CircleAlert, Clock3, Ellipsis, HeartPulse, Layers3, LoaderCircle, LogOut, Pause, Play, Plus, RefreshCw, Search, Send, Server, ShieldCheck, Square, TerminalSquare, X } from 'lucide-react';
 import { api, ApiError, concurrent, isDemo } from './api';
-import { actionLabels, stateLabels, type Account, type AccountMachines, type Action, type ActionType, type Machine, type Session } from '../shared/types';
+import { actionLabels, actionSourceLabels, stateLabels, type Account, type AccountMachines, type Action, type ActionType, type Machine, type Session } from '../shared/types';
 import AuthScreen from './AuthScreen';
 import KeepaliveForm from './KeepaliveForm';
 import TelegramForm from './TelegramForm';
@@ -171,7 +171,7 @@ function Dashboard({session,signedOut}:{session:Session;signedOut:()=>void}){
     }catch(e){
       authError(e);notify(message(e),true);
       if(e instanceof ApiError&&(e.code==='network_error'||e.status>=500)){
-        const a:Action={id:requestId,accountId:row.account.id,machineId:row.machine.id,machineName:row.machine.name,type,state:'unknown',operationId:null,phase:'',errorCode:e.code,errorMessage:'连接中断，结果尚未确认。重试会复用原请求。',createdAt:retry?.createdAt||new Date().toISOString(),updatedAt:new Date().toISOString(),processesPreserved:null};
+        const a:Action={id:requestId,accountId:row.account.id,machineId:row.machine.id,machineName:row.machine.name,type,source:retry?.source||'web',state:'unknown',operationId:null,phase:'',errorCode:e.code,errorMessage:'连接中断，结果尚未确认。重试会复用原请求。',createdAt:retry?.createdAt||new Date().toISOString(),updatedAt:new Date().toISOString(),processesPreserved:null};
         setActions(p=>merge(p,a));setHistory(true);
       }
     }finally{submitLock.current.delete(row.machine.id);setSubmitting(new Set(submitLock.current));}
@@ -248,7 +248,7 @@ function Dashboard({session,signedOut}:{session:Session;signedOut:()=>void}){
     {keepaliveRow&&<KeepaliveForm row={latest(keepaliveRow)} overview={keepalive} close={()=>setKeepaliveRow(null)} saved={value=>{setKeepalive(value);notify('保活设置已保存。');}}/>}
     {telegramOpen&&<TelegramForm close={()=>setTelegramOpen(false)}/>}
     {terminals.map((terminal,index)=><Suspense key={terminal.machine.id} fallback={<div className="toast" role="status">正在加载终端…</div>}><TerminalPane row={latest(terminal)} control={control(latest(terminal))} index={index} active={activeTerminal===terminal.machine.id} onActivate={()=>setActiveTerminal(terminal.machine.id)} onClose={()=>setTerminals(current=>current.filter(row=>row.machine.id!==terminal.machine.id))}/></Suspense>)}
-    {history&&<Modal title="操作记录" onClose={()=>setHistory(false)} wide><p className="dialog-description">跟踪请求直到完成；刷新页面后仍可继续查看。</p>{!actions.length?<div className="empty"><Activity size={30}/><h3>还没有操作记录</h3></div>:<div className="history-list">{actions.map(a=><div className="history-row" key={a.id}><span className={'history-icon '+a.state}>{pending(a)?<LoaderCircle size={18} className="spin"/>:a.state==='succeeded'?<Check size={18}/>:<CircleAlert size={18}/>}</span><div className="history-body"><strong>{actionLabels[a.type]} · {a.machineName}</strong><small>{accounts.find(x=>x.id===a.accountId)?.label||'已移除账号'} · {new Date(a.createdAt).toLocaleString('zh-CN')}</small>{a.errorMessage&&<p className="history-error">{a.errorMessage}</p>}{a.type==='resume'&&a.processesPreserved===false&&<p className="history-error">机器已重新启动，原来的进程未保留。</p>}</div><div className="history-result"><span>{{submitting:'提交中',queued:'排队中',running:'执行中',succeeded:'已完成',failed:'失败',unknown:'结果待确认'}[a.state]}</span>{a.state==='unknown'&&<button className="button compact" disabled={submitting.has(a.machineId)} onClick={()=>retry(a)}>重试原请求</button>}</div></div>)}</div>}</Modal>}
+    {history&&<Modal title="操作记录" onClose={()=>setHistory(false)} wide><p className="dialog-description">跟踪 Web、TG 和保活定时器的操作；刷新页面后仍可继续查看。</p>{!actions.length?<div className="empty"><Activity size={30}/><h3>还没有操作记录</h3></div>:<div className="history-list">{actions.map(a=><div className="history-row" key={a.id}><span className={'history-icon '+a.state}>{pending(a)?<LoaderCircle size={18} className="spin"/>:a.state==='succeeded'?<Check size={18}/>:<CircleAlert size={18}/>}</span><div className="history-body"><strong>{actionLabels[a.type]} · {a.machineName}</strong><small>{accounts.find(x=>x.id===a.accountId)?.label||'已移除账号'} · {new Date(a.createdAt).toLocaleString('zh-CN')}</small><p className="history-origin">操作备注：{actionSourceLabels[a.source||'unknown']}</p>{a.errorMessage&&<p className="history-error">{a.errorMessage}</p>}{a.type==='resume'&&a.processesPreserved===false&&<p className="history-error">机器已重新启动，原来的进程未保留。</p>}</div><div className="history-result"><span>{{submitting:'提交中',queued:'排队中',running:'执行中',succeeded:'已完成',failed:'失败',unknown:'结果待确认'}[a.state]}</span>{a.state==='unknown'&&<button className="button compact" disabled={submitting.has(a.machineId)} onClick={()=>retry(a)}>重试原请求</button>}</div></div>)}</div>}</Modal>}
   </div>;
 }
 function Details({row,control,close,stop,busy,terminal}:{row:MachineRow;control:ReactNode;close:()=>void;stop:()=>void;busy:boolean;terminal:()=>void}){
