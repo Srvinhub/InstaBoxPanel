@@ -1,14 +1,16 @@
 import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
-import { Copy, Maximize2, Minimize2, Minus, Plus, RefreshCw, X, ClipboardPaste, TerminalSquare } from 'lucide-react';
+import { Copy, Maximize2, Minimize2, Minus, Plus, RefreshCw, X, ClipboardPaste, TerminalSquare, PanelBottomClose } from 'lucide-react';
 import '@xterm/xterm/css/xterm.css';
 import { isDemo } from './api';
 import type { MachineRow } from './App';
 import { useFloatingWindow } from './useFloatingWindow';
 
-export default function TerminalPane({ row, control, onClose, index, active, onActivate }: { row: MachineRow; control: ReactNode; onClose: () => void; index: number; active: boolean; onActivate: () => void }) {
+export default function TerminalPane({ row, control, onClose, onMinimize, minimized, index, active, onActivate }: { row: MachineRow; control: ReactNode; onClose: () => void; onMinimize: () => void; minimized: boolean; index: number; active: boolean; onActivate: () => void }) {
   const mount=useRef<HTMLDivElement>(null), term=useRef<Terminal|null>(null), socket=useRef<WebSocket|null>(null);
+  const windowRef=useRef<HTMLElement>(null), focusAllowed=useRef(active&&!minimized);
+  focusAllowed.current=active&&!minimized;
   const titleId=useId(), floating=useFloatingWindow(index), resizeTerminal=useRef<()=>void>(()=>{});
   const [status,setStatus]=useState('等待连接'),[error,setError]=useState(''),[attempt,setAttempt]=useState(0),[fontSize,setFontSize]=useState(13);
   const [connected,setConnected]=useState(false);
@@ -25,7 +27,7 @@ export default function TerminalPane({ row, control, onClose, index, active, onA
     let resizeFrame=0;
     const resize=()=>{cancelAnimationFrame(resizeFrame);resizeFrame=requestAnimationFrame(()=>{if(disposed||!mount.current?.clientHeight)return;fit.fit();if(socket.current?.readyState===WebSocket.OPEN)socket.current.send(JSON.stringify({type:'resize',cols:Math.max(10,Math.min(1000,terminal.cols)),rows:Math.max(4,Math.min(500,terminal.rows))}));});};
     resizeTerminal.current=resize;
-    const observer=new ResizeObserver(resize);observer.observe(mount.current);resize();terminal.focus();
+    const observer=new ResizeObserver(resize);observer.observe(mount.current);resize();if(focusAllowed.current)terminal.focus();
     const onFocus=()=>resize();window.addEventListener('resize',onFocus);
     const encoder=new TextEncoder();
     let input='';
@@ -50,7 +52,7 @@ export default function TerminalPane({ row, control, onClose, index, active, onA
       url.searchParams.set('cols',String(Math.max(10,Math.min(1000,terminal.cols))));
       url.searchParams.set('rows',String(Math.max(4,Math.min(500,terminal.rows))));
       const ws=new WebSocket(url);ws.binaryType='arraybuffer';socket.current=ws;
-      ws.onopen=()=>{if(disposed)return;setStatus('已连接');setConnected(true);terminal.options.disableStdin=false;resize();terminal.focus();};
+      ws.onopen=()=>{if(disposed)return;setStatus('已连接');setConnected(true);terminal.options.disableStdin=false;resize();if(focusAllowed.current)terminal.focus();};
       ws.onmessage=event=>{
         if(disposed)return;
         if(typeof event.data!=='string'){terminal.write(new Uint8Array(event.data as ArrayBuffer));return;}
@@ -80,20 +82,26 @@ export default function TerminalPane({ row, control, onClose, index, active, onA
     return()=>{disposed=true;cancelAnimationFrame(resizeFrame);resizeTerminal.current=()=>{};observer.disconnect();window.removeEventListener('resize',onFocus);dataSubscription?.dispose();binarySubscription?.dispose();socket.current?.close(1000,'panel closed');socket.current=null;terminal.dispose();term.current=null;};
   },[canConnect,row.account.id,row.machine.id,attempt]);
   useEffect(()=>{if(term.current)term.current.options.fontSize=fontSize;resizeTerminal.current();},[fontSize,attempt]);
+  useEffect(()=>{
+    if(minimized){if(windowRef.current?.contains(document.activeElement))term.current?.blur();return;}
+    resizeTerminal.current();
+    if(active)term.current?.focus();
+  },[minimized,active]);
   const sendKey=(value:string)=>{if(isDemo){term.current?.input(value,true);}else if(socket.current?.readyState===WebSocket.OPEN){socket.current.send(new TextEncoder().encode(value));}term.current?.focus();};
   const clipboard=async(paste:boolean)=>{try{if(paste)term.current?.paste(await navigator.clipboard.readText());else await navigator.clipboard.writeText(term.current?.getSelection()||'');term.current?.focus();}catch{setError('无法访问剪贴板，请使用浏览器允许的复制粘贴方式。');}};
-  return <section role="dialog" aria-modal="false" className={'terminal-dialog floating-terminal'+(floating.maximized?' maximized':'')+(active?' active':'')} aria-labelledby={titleId} style={{...floating.style,zIndex:active?200:100+index}} onPointerDownCapture={onActivate} onFocusCapture={onActivate}>
+  return <section ref={windowRef} hidden={minimized} role="dialog" aria-modal="false" className={'terminal-dialog floating-terminal'+(floating.maximized?' maximized':'')+(active?' active':'')} aria-labelledby={titleId} style={{...floating.style,zIndex:active?200:100+index}} onPointerDownCapture={onActivate} onFocusCapture={onActivate}>
     <header className="terminal-heading" {...floating.drag} onDoubleClick={event=>{if(!(event.target as HTMLElement).closest('button'))floating.toggleMaximized();}}><div className="terminal-title"><TerminalSquare size={18}/><h2 id={titleId}>{row.machine.name}</h2><span>{isDemo?'演示':row.account.label}</span></div><div className="terminal-title-actions">
       <button className="terminal-icon" aria-label="复制选中内容" onClick={()=>void clipboard(false)}><Copy size={15}/></button><button className="terminal-icon" aria-label="粘贴到终端" onClick={()=>void clipboard(true)}><ClipboardPaste size={15}/></button>
       <button className="terminal-icon" aria-label="缩小终端字体" onClick={()=>setFontSize(s=>Math.max(11,s-1))}><Minus size={15}/></button><button className="terminal-icon" aria-label="放大终端字体" onClick={()=>setFontSize(s=>Math.min(20,s+1))}><Plus size={15}/></button>
+      <button className="terminal-icon" aria-label="最小化终端窗口" title="最小化，保持连接" onClick={onMinimize}><PanelBottomClose size={16}/></button>
       <button className="terminal-icon" aria-label={floating.maximized?'还原终端窗口':'最大化终端窗口'} title={floating.maximized?'还原窗口':'最大化到页面'} onClick={floating.toggleMaximized}>{floating.maximized?<Minimize2 size={16}/>:<Maximize2 size={16}/>}</button>
-      <button className="terminal-icon terminal-close" aria-label="关闭终端" onClick={onClose}><X size={20}/></button>
+      <button className="terminal-icon terminal-close" aria-label="关闭终端" title="收起，60 秒后断开；期间可从右下角恢复" onClick={onClose}><X size={20}/></button>
     </div></header>
     {error&&<div className="terminal-error" role="alert">{error}</div>}
     {canConnect?<div className="terminal-mount" ref={mount}/>:<div className="terminal-wait"><TerminalSquare size={34}/><p>机器运行后，可以连接它的交互终端。</p>{control}</div>}
     <footer className="terminal-footer"><div className="terminal-keys">{[['Ctrl+C','\x03'],['Ctrl+D','\x04'],['Ctrl+L','\x0c'],['Ctrl+R','\x12'],['Ctrl+W','\x17'],['Tab','\t'],['Esc','\x1b'],['↑','\x1b[A'],['↓','\x1b[B']].map(([name,value])=><button key={name} disabled={!canConnect||!connected} onClick={()=>sendKey(value)}>{name}</button>)}</div>
-      <div className="terminal-statusbar"><span className={'terminal-state '+(canConnect&&connected?'connected':'disconnected')} role="status"><span className="connection-dot"/>{canConnect?status:'已断开 · 请先恢复或启动机器'}</span><button className="terminal-reconnect" aria-label="重新连接终端" disabled={!canConnect} onClick={()=>setAttempt(current=>current+1)}><RefreshCw size={13}/>{connected?'重连':'重新连接'}</button><span className="terminal-hint">Esc 传给终端 · 关闭保留远端会话</span></div>
+      <div className="terminal-statusbar"><span className={'terminal-state '+(canConnect&&connected?'connected':'disconnected')} role="status"><span className="connection-dot"/>{canConnect?status:'已断开 · 请先恢复或启动机器'}</span><button className="terminal-reconnect" aria-label="重新连接终端" disabled={!canConnect} onClick={()=>setAttempt(current=>current+1)}><RefreshCw size={13}/>{connected?'重连':'重新连接'}</button><span className="terminal-hint">最小化保持连接 · × 延迟 60 秒断开</span></div>
     </footer>
-    {!floating.maximized&&<div className="terminal-resize" aria-label="拖动调整终端大小" {...floating.resize}/>}
+    {!floating.maximized&&(['nw','ne','sw','se'] as const).map(corner=><div key={corner} className={'terminal-resize terminal-resize-'+corner} aria-label={'拖动'+({nw:'左上角',ne:'右上角',sw:'左下角',se:'右下角'}[corner])+'调整终端大小'} {...floating.resize(corner)}/>)}
   </section>;
 }

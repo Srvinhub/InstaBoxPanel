@@ -3,6 +3,7 @@ import { chromium } from 'playwright';
 import { spawn } from 'node:child_process';
 import { access, mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { checkTerminalConnections } from './terminal-browser-check.mjs';
 const root=process.cwd(),base='http://127.0.0.1:4177',output=path.join(root,'test-results');
 await mkdir(output,{recursive:true});
 let executablePath;
@@ -34,7 +35,7 @@ try{
   await dev.getByRole('button',{name:'暂停',exact:true}).click();await dev.locator('.state-badge').filter({hasText:'已暂停'}).waitFor({timeout:10000});
   await dev.getByRole('button',{name:'恢复',exact:true}).click();await dev.locator('.state-badge').filter({hasText:'运行中'}).waitFor({timeout:10000});
   step('pause and resume wait for completion');
-  await page.getByRole('button',{name:/操作记录/}).click();
+  await page.getByRole('link',{name:/操作记录/}).filter({visible:true}).click();
   await page.locator('dialog .history-origin').first().waitFor();
   assert.equal(await page.locator('dialog .history-origin').count(),2);
   assert.ok((await page.locator('dialog .history-origin').allTextContents()).every(text=>text==='操作备注：来自 Web'));
@@ -57,7 +58,7 @@ try{
   assert.equal(await page.locator('.keepalive-window').count(),5);assert.equal(await page.getByLabel('时间范围 1 开始',{exact:true}).inputValue(),'22:00');
   await page.locator('input[name="keepalive-mode"][value="off"]').check();await page.getByRole('button',{name:'保存保活设置',exact:true}).click();
   step('keepalive defaults off, persists all-day and five daily windows, and can be disabled');
-  await page.getByRole('button',{name:'Telegram 设置',exact:true}).click();await page.getByLabel('私人聊天 ID',{exact:true}).waitFor();
+  await page.getByRole('link',{name:'Telegram 设置',exact:true}).click();await page.getByLabel('私人聊天 ID',{exact:true}).waitFor();
   assert.equal(await page.getByText(/AUTOMATION_SECRET/).count(),0);
   assert.equal(await page.getByRole('checkbox',{name:/机器离线时通知我/}).isChecked(),false);
   await page.getByLabel('Bot Token',{exact:true}).fill('123456789:demo_token_not_sent_to_telegram');await page.getByLabel('私人聊天 ID',{exact:true}).fill('12345678');
@@ -82,9 +83,17 @@ try{
   const original=await secondWindow.boundingBox();const title=await secondWindow.locator('h2').boundingBox();
   await page.mouse.move(title.x+10,title.y+8);await page.mouse.down();await page.mouse.move(title.x+70,title.y+58,{steps:8});await page.mouse.up();
   const moved=await secondWindow.boundingBox();assert.ok(moved.x>original.x+40&&moved.y>original.y+30,'terminal moves by its title');
-  const handle=await secondWindow.locator('.terminal-resize').boundingBox();
-  await page.mouse.move(handle.x+15,handle.y+15);await page.mouse.down();await page.mouse.move(handle.x-140,handle.y-100,{steps:8});await page.mouse.up();
+  const handle=await secondWindow.locator('.terminal-resize-se').boundingBox();
+  await page.mouse.move(handle.x+10,handle.y+10);await page.mouse.down();await page.mouse.move(handle.x-140,handle.y-100,{steps:8});await page.mouse.up();
   const resized=await secondWindow.boundingBox();assert.ok(resized.width<moved.width-100&&resized.height<moved.height-80,'terminal resizes by its handle');
+  for(const corner of ['nw','ne','sw']){
+    const before=await secondWindow.boundingBox(),west=corner.endsWith('w'),north=corner.startsWith('n');
+    const x=west?before.x+7:before.x+before.width-7,y=north?before.y+7:before.y+before.height-7;
+    await page.mouse.move(x,y);await page.mouse.down();await page.mouse.move(x+(west?30:-30),y+(north?25:-25),{steps:5});await page.mouse.up();
+    const after=await secondWindow.boundingBox();assert.ok(Math.abs(after.width-before.width+30)<2&&Math.abs(after.height-before.height+25)<2,corner+' resizes both axes');
+    assert.ok(Math.abs((west?after.x+after.width:after.x)-(west?before.x+before.width:before.x))<2,corner+' anchors opposite horizontal edge');
+    assert.ok(Math.abs((north?after.y+after.height:after.y)-(north?before.y+before.height:before.y))<2,corner+' anchors opposite vertical edge');
+  }
   const secondInput=secondWindow.locator('.xterm-helper-textarea');await secondInput.focus();await secondInput.pressSequentially('pwd');await secondInput.press('Enter');
   await secondWindow.getByText('/data/home/workspace',{exact:false}).first().waitFor();
   await page.getByRole('button',{name:'打开 development 终端',exact:true}).click();assert.equal(await page.locator('.floating-terminal').count(),2);
@@ -93,6 +102,14 @@ try{
   await page.getByRole('textbox',{name:'搜索机器'}).fill('');
   await page.screenshot({path:path.join(output,'terminal-floating-desktop.png')});
   await secondWindow.getByRole('button',{name:'关闭终端',exact:true}).click();step('multiple nonmodal terminals move, resize, maximize, retain independent sessions, and allow dashboard interaction');
+  await page.getByRole('button',{name:'恢复 personal-workspace 终端',exact:true}).click();
+  const retained=await secondWindow.boundingBox();await secondWindow.getByText('/data/home/workspace',{exact:false}).first().waitFor();
+  await secondWindow.getByRole('button',{name:'最小化终端窗口',exact:true}).click();await secondWindow.waitFor({state:'hidden'});
+  await page.getByRole('button',{name:'恢复 personal-workspace 终端',exact:true}).click();assert.deepEqual(await secondWindow.boundingBox(),retained);
+  await secondWindow.getByRole('button',{name:'关闭终端',exact:true}).click();
+  await page.getByRole('button',{name:'立即断开 personal-workspace 终端',exact:true}).click();await secondWindow.waitFor({state:'detached'});
+  await page.getByRole('button',{name:'立即断开 development 终端',exact:true}).click();
+  assert.equal(await page.locator('.floating-terminal').count(),0);step('minimize and delayed close restore the same output and bounds; dock close disposes windows');
   await page.locator('.page-heading').getByRole('button',{name:'添加账号',exact:true}).click();
   await page.getByLabel('账号别名',{exact:true}).fill('测试失效账号');await page.getByLabel('API Key',{exact:true}).fill('ibk_demo_error');await page.getByRole('button',{name:'保存账号',exact:true}).click();
   await page.locator('.account-error').filter({hasText:'测试失效账号'}).waitFor();assert.equal(await page.locator('.machines tbody tr').count(),5);
@@ -100,12 +117,26 @@ try{
   await page.getByRole('button',{name:'管理账号 测试失效账号',exact:true}).click();await page.getByLabel('替换 API Key',{exact:true}).fill('ibk_demo_example');await page.getByRole('button',{name:'保存账号',exact:true}).click();await page.locator('.account-error').waitFor({state:'detached'});
   await page.getByRole('button',{name:'管理账号 测试失效账号',exact:true}).click();await page.getByRole('button',{name:'移除账号',exact:true}).click();await page.getByRole('button',{name:'确认移除',exact:true}).click();await page.getByRole('button',{name:'管理账号 测试失效账号',exact:true}).waitFor({state:'detached'});
   assert.equal(await page.locator('.machines tbody tr').count(),5);step('key replacement and account removal');
+  assert.equal(await page.locator('.site-footer a').first().getAttribute('href'),'https://github.com/meicuode/InstaBoxPanel');
+  assert.equal(await page.locator('.site-footer a').last().getAttribute('href'),'https://cfnote.zuichu.de/blog?tag=InstaBox');
+  await page.locator('.account-select').filter({hasText:'实验室'}).click();assert.equal(new URL(page.url()).pathname,'/accounts/demo-lab');
+  await page.getByRole('link',{name:/操作记录/}).filter({visible:true}).click();assert.equal(new URL(page.url()).pathname,'/history');assert.equal(new URL(page.url()).searchParams.get('account'),'demo-lab');
+  await page.goBack();await page.locator('dialog').waitFor({state:'detached'});assert.equal(await page.locator('.machines tbody tr').count(),2);
+  await page.goForward();await page.locator('dialog .history-list').waitFor();
+  const setupAfterReload=async()=>{await page.reload();await page.getByLabel('管理员账号',{exact:true}).fill('panel-admin');await page.getByLabel('密码',{exact:true}).fill('browser-demo-password');await page.getByLabel('确认密码',{exact:true}).fill('browser-demo-password');await page.getByRole('button',{name:'创建管理员并进入',exact:true}).click();await page.locator('.machines tbody tr').first().waitFor();};
+  await setupAfterReload();await page.locator('dialog').getByRole('heading',{name:'操作记录',exact:true}).waitFor();
+  await page.locator('dialog').getByRole('button',{name:'关闭',exact:true}).click();assert.equal(new URL(page.url()).pathname,'/accounts/demo-lab');
+  await setupAfterReload();assert.equal(await page.locator('.machines tbody tr').count(),2);await page.getByRole('heading',{name:'实验室',exact:true}).waitFor();
+  await page.getByRole('link',{name:'Telegram 设置',exact:true}).click();await setupAfterReload();await page.getByLabel('私人聊天 ID',{exact:true}).waitFor();
+  await page.locator('dialog').getByRole('button',{name:'关闭',exact:true}).click();
+  step('menu routes survive reload and authentication, browser back/forward restores views, and footer links match');
   await page.setViewportSize({width:390,height:844});await page.getByRole('combobox',{name:'当前账号'}).selectOption('demo-lab');assert.equal(await page.locator('.machines tbody tr').count(),2);
   await page.getByRole('combobox',{name:'当前账号'}).selectOption('all');assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),'mobile horizontal overflow');
   await page.screenshot({path:path.join(output,'dashboard-mobile.png'),fullPage:true});
   await page.getByRole('button',{name:'打开 development 终端',exact:true}).click();await page.locator('.xterm-helper-textarea').waitFor();assert.ok(await page.evaluate(()=>document.querySelector('.terminal-dialog').getBoundingClientRect().width<=innerWidth));
   await page.screenshot({path:path.join(output,'terminal-mobile.png')});step('mobile selection, dashboard layout, and terminal');
   await page.getByRole('button',{name:'退出登录',exact:true}).filter({visible:true}).click();await page.getByRole('heading',{name:'登录私人控制台',exact:true}).waitFor();assert.equal(await page.locator('.floating-terminal').count(),0);assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));await page.screenshot({path:path.join(output,'login-mobile.png')});step('mobile logout closes terminals and preserves login layout');
+  await checkTerminalConnections(browser,root,output);step('WebSocket survives minimization and restore; 60-second timeout, immediate close, and logout disconnect');
   assert.deepEqual(failures,[],'browser errors');await writeFile(path.join(output,'browser-report.json'),JSON.stringify({passed:steps,errors:failures},null,2)+'\n');console.log('Browser checks passed: '+steps.length);
 }catch(error){if(browser){const page=browser.contexts()[0]?.pages()[0];if(page)await page.screenshot({path:path.join(output,'failure.png'),fullPage:true}).catch(()=>{});}console.error(error);process.exitCode=1;}
 finally{await browser?.close();child.kill();}

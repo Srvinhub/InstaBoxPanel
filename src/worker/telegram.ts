@@ -13,12 +13,37 @@ interface BotRow {
   id: number; username: string; chat_id: string; token_ciphertext: string; token_iv: string;
   webhook_hash: string; notify_offline: number; last_error: string; updated_at: string;
 }
-interface TelegramMessage { text?: string; date?: number; from?: { id: number; is_bot?: boolean }; chat: { id: number; type: string } }
-interface TelegramUpdate { update_id: number; message?: TelegramMessage }
+interface TelegramMessage { message_id?: number; text?: string; date?: number; from?: { id: number; is_bot?: boolean }; chat: { id: number; type: string } }
+interface TelegramCallback { id: string; data?: string; from?: { id: number; is_bot?: boolean }; message?: TelegramMessage }
+interface TelegramUpdate { update_id: number; message?: TelegramMessage; callback_query?: TelegramCallback }
+interface Button { text: string; command: string }
+interface Reply { text: string; buttons?: Button[][]; html?: boolean }
+interface ButtonRow { command: string; request_id: string }
 interface WatchRow { machine_id: string; account_id: string; state: string; pending_text: string | null }
 const defaultFetcher: Fetcher = (input, init) => fetch(input, init);
 const ongoing = ['submitting', 'queued', 'running', 'unknown'];
 const label = (value: string) => value.replace(/[\r\n\u0000-\u001f]/g, ' ').slice(0, 80);
+const html = (value: string) => value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const safeLabel = (value: string) => html(label(value));
+const stateIcon = (state: string) => (({ running: '🟢', suspended: '🟡', stopped: '⚪', error: '🔴', deleted: '⚫' } as Record<string, string>)[state] || '🔄');
+const button = (text: string, command: string): Button => ({ text, command });
+const homeButtons = () => [[button('🗂 查看账号', '/accounts'), button('🔔 通知设置', '/notifications')]];
+const machineButtons = (accountId: string, machineId: string): Button[][] => [
+  [button('🔄 查看状态', '/status ' + accountId + ' ' + machineId)],
+  [button('‹ 机器列表', '/machines ' + accountId), button('🗂 账号列表', '/accounts')],
+];
+
+async function keyboard(db: D1Database, bot: BotRow, rows: Button[][]) {
+  const statements = [db.prepare('DELETE FROM insb_telegram_buttons WHERE expires_at<? OR webhook_hash<>?').bind(Date.now(), bot.webhook_hash)];
+  const inline_keyboard = rows.map(row => row.map(item => {
+    const token = crypto.randomUUID().replace(/-/g, '');
+    statements.push(db.prepare('INSERT INTO insb_telegram_buttons (token,command,request_id,webhook_hash,expires_at) VALUES (?,?,?,?,?)')
+      .bind(token, item.command, crypto.randomUUID(), bot.webhook_hash, Date.now() + 7 * 86400000));
+    return { text: item.text, callback_data: 'ib:' + token };
+  }));
+  await db.batch(statements);
+  return { inline_keyboard };
+}
 
 class Telegram {
   constructor(private token: string, private fetcher: Fetcher = defaultFetcher) {}
@@ -37,9 +62,14 @@ class Telegram {
     if (!response.ok || data?.ok !== true) throw new PanelError(502, 'telegram_request_failed', 'Telegram 请求失败，请检查机器人 Token、聊天 ID，并先向机器人发送 /start。', true);
     return data.result;
   }
-  async send(chatId: string, text: string) {
-    for (let offset = 0; offset < text.length; offset += 3500)
-      await this.request('sendMessage', { chat_id: chatId, text: text.slice(offset, offset + 3500), link_preview_options: { is_disabled: true } });
+  async reply(db: D1Database, bot: BotRow, reply: Reply, messageId?: number) {
+    const reply_markup = reply.buttons ? await keyboard(db, bot, reply.buttons) : { inline_keyboard: [] };
+    const body = { chat_id: bot.chat_id, text: reply.text, ...(reply.html ? { parse_mode: 'HTML' } : {}), reply_markup, link_preview_options: { is_disabled: true } };
+    if (messageId !== undefined) {
+      try { await this.request('editMessageText', { ...body, message_id: messageId }); return; }
+      catch { /* Deleted or uneditable messages can still receive a fresh reply. */ }
+    }
+    await this.request('sendMessage', body);
   }
 }
 async function botRow(db: D1Database) { return db.prepare('SELECT * FROM insb_telegram WHERE id=1').first<BotRow>(); }
@@ -98,7 +128,7 @@ export async function saveTelegram(env: AutomationEnv, value: unknown, origin: s
   await enableAutomation(env, dataKey);
   const webhookSecret = encode(crypto.getRandomValues(new Uint8Array(32))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   const encrypted = await encryptAutomation(env, token, 'telegram:1');
-  await telegram.request('setWebhook', { url: origin + '/api/telegram/webhook', secret_token: webhookSecret, allowed_updates: ['message'], max_connections: 1 });
+  await telegram.request('setWebhook', { url: origin + '/api/telegram/webhook', secret_token: webhookSecret, allowed_updates: ['message', 'callback_query'], max_connections: 1 });
   try {
     await env.DB.batch([
       env.DB.prepare(`DELETE FROM insb_machine_watch WHERE NOT EXISTS
@@ -124,7 +154,7 @@ export async function removeTelegram(env: AutomationEnv, fetcher?: Fetcher) {
     try { await (await botClient(env, row, fetcher)).request('deleteWebhook', { drop_pending_updates: true }); }
     catch { warning = '本地绑定已解除；Telegram 端 Webhook 未确认移除，可通过 BotFather 撤销旧 Token。'; }
   }
-  await env.DB.batch([env.DB.prepare('DELETE FROM insb_telegram'), env.DB.prepare('DELETE FROM insb_machine_watch'), env.DB.prepare('DELETE FROM insb_telegram_updates')]);
+  await env.DB.batch([env.DB.prepare('DELETE FROM insb_telegram'), env.DB.prepare('DELETE FROM insb_machine_watch'), env.DB.prepare('DELETE FROM insb_telegram_updates'), env.DB.prepare('DELETE FROM insb_telegram_buttons')]);
   return { ok: true, warning };
 }
 async function findAccount(db: D1Database, reference: string) {
@@ -156,43 +186,64 @@ async function submitAction(env: AutomationEnv, account: AccountRow, remote: Ins
   const keepalive = type === 'suspend' && await env.DB.prepare("SELECT machine_id FROM insb_keepalive WHERE machine_id=? AND mode<>'off'").bind(machine.id).first();
   return (type === 'resume' ? '恢复' : '暂停') + ' ' + label(machine.name) + '：' + description + (keepalive ? '\n这台机器已开启保活，时间窗口内下一次检查可能自动恢复。' : '');
 }
-const help = 'InstaBox Panel\n/accounts [页码] — 查看绑定账号\n/machines 账号ID [页码] — 查看账号机器\n/status 账号ID 机器ID — 查询状态\n/resume 账号ID 机器ID — 恢复暂停机器\n/suspend 账号ID 机器ID — 暂停运行机器\n/notifications on 或 off — 开关离线通知\n/help — 显示帮助\n账号可以使用唯一别名；机器使用完整 ID。';
-async function command(env: AutomationEnv, bot: BotRow, text: string, requestId: string, fetcher?: Fetcher) {
+const help = '<b>InstaBox Panel</b>\n你的私人机器控制台\n\n点击下方按钮，选择账号和机器，即可查看状态、恢复或暂停。\n\n<b>也可以发送命令</b>\n/accounts — 账号列表\n/machines 账号ID — 机器列表\n/status 账号ID 机器ID — 查看状态\n/resume 账号ID 机器ID — 恢复\n/suspend 账号ID 机器ID — 暂停\n/notifications — 通知设置\n/help — 使用帮助';
+async function command(env: AutomationEnv, bot: BotRow, text: string, requestId: string, fetcher?: Fetcher): Promise<Reply> {
   const [raw, ...args] = text.trim().split(/\s+/);
   const name = raw.split('@')[0].toLowerCase();
-  if (['/start', '/help'].includes(name)) return help;
+  if (['/start', '/help'].includes(name)) return { text: help, html: true, buttons: homeButtons() };
   if (name === '/accounts') {
     const page = Number(args[0] || '1');
-    if (!Number.isSafeInteger(page) || page < 1) return '页码需要为正整数。';
+    if (!Number.isSafeInteger(page) || page < 1 || page > 100000) return { text: '页码需要为 1–100000 的整数。', buttons: homeButtons() };
     const accounts = await env.DB.prepare('SELECT * FROM insb_accounts WHERE deleted_at IS NULL ORDER BY created_at,id LIMIT 11 OFFSET ?').bind((page - 1) * 10).all<AccountRow>();
-    return accounts.results.length ? accounts.results.slice(0, 10).map(account => label(account.label) + (account.enabled ? ' · 已启用' : ' · 已停用') + '\n/machines ' + account.id).join('\n\n') + (accounts.results.length > 10 ? '\n\n下一页：/accounts ' + (page + 1) : '') : '没有更多绑定账号，请先在面板添加。';
+    const selected = accounts.results.slice(0, 10);
+    const buttons = selected.filter(account => account.enabled).map(account => [button('🗂 ' + label(account.label), '/machines ' + account.id)]);
+    const pages = [...(page > 1 ? [button('‹ 上一页', '/accounts ' + (page - 1))] : []), ...(accounts.results.length > 10 ? [button('下一页 ›', '/accounts ' + (page + 1))] : [])];
+    if (pages.length) buttons.push(pages);
+    buttons.push([button('🔔 通知设置', '/notifications'), button('帮助', '/help')]);
+    return { html: true, text: '<b>🗂 已连接账号</b> · 第 ' + page + ' 页\n\n' + (selected.length
+      ? selected.map(account => (account.enabled ? '🟢 ' : '⚪ ') + '<b>' + safeLabel(account.label) + '</b> · ' + (account.enabled ? '已启用' : '已停用')).join('\n') + '\n\n选择账号，查看它的机器。'
+      : '没有更多绑定账号，请先在面板添加。'), buttons };
   }
   if (name === '/notifications') {
-    if (!['on', 'off'].includes(args[0])) return '用法：/notifications on 或 /notifications off';
+    if (!args[0]) return { html: true, text: '<b>🔔 离线通知</b>\n\n当前：' + (bot.notify_offline ? '已开启' : '已关闭') + '\n机器从运行变为暂停、停止或异常时通知；首次检查建立基线。', buttons: [[button(bot.notify_offline ? '关闭通知' : '开启通知', '/notifications ' + (bot.notify_offline ? 'off' : 'on'))], [button('‹ 账号列表', '/accounts')]] };
+    if (!['on', 'off'].includes(args[0])) return { text: '用法：/notifications on 或 /notifications off', buttons: homeButtons() };
     const enabled = Number(args[0] === 'on');
     await env.DB.batch([
       env.DB.prepare('DELETE FROM insb_machine_watch WHERE EXISTS(SELECT id FROM insb_telegram WHERE id=1 AND webhook_hash=? AND notify_offline<>?)').bind(bot.webhook_hash, enabled),
       env.DB.prepare('UPDATE insb_telegram SET notify_offline=? WHERE id=1 AND webhook_hash=? AND notify_offline<>?').bind(enabled, bot.webhook_hash, enabled),
     ]);
-    return args[0] === 'on' ? '离线通知已开启。第一次检查建立基线，之后从运行变为暂停、停止或异常时通知；同一次离线不会持续提醒。' : '离线通知已关闭。';
+    return { text: args[0] === 'on' ? '🔔 离线通知已开启。第一次检查建立基线，之后从运行变为暂停、停止或异常时通知；同一次离线不会持续提醒。' : '🔕 离线通知已关闭。', buttons: homeButtons() };
   }
-  if (!['/machines', '/status', '/resume', '/suspend'].includes(name)) return help;
-  if (!args[0] || (name !== '/machines' && !args[1])) return '请按帮助提供账号 ID 和机器 ID。\n' + help;
+  if (!['/machines', '/status', '/resume', '/suspend', '/confirm-suspend'].includes(name)) return { text: help, html: true, buttons: homeButtons() };
+  if (!args[0]) return command(env, bot, '/accounts', requestId, fetcher);
+  if (name !== '/machines' && !args[1]) return command(env, bot, '/machines ' + args[0], requestId, fetcher);
   const account = await findAccount(env.DB, args[0]);
   const dataKey = await automationDataKey(env);
   const remote = new Instabox(await decryptKey(account.key_ciphertext, account.key_iv, dataKey, account.id), fetcher);
   if (name === '/machines') {
     const page = Number(args[1] || '1');
-    if (!Number.isSafeInteger(page) || page < 1) return '页码需要为正整数。';
-    const machines = await remote.list(), selected = machines.slice((page - 1) * 8, page * 8);
-    return label(account.label) + '\n' + (selected.length ? selected.map(machine => label(machine.name) + ' · ' + stateLabels[machine.state] + '\n/status ' + account.id + ' ' + machine.id).join('\n\n') : '没有更多机器。') + (machines.length > page * 8 ? '\n下一页：/machines ' + account.id + ' ' + (page + 1) : '');
+    if (!Number.isSafeInteger(page) || page < 1 || page > 100000) return { text: '页码需要为 1–100000 的整数。', buttons: homeButtons() };
+    const machines = (await remote.list()).filter(machine => machine.state !== 'deleted'), selected = machines.slice((page - 1) * 8, page * 8);
+    const buttons = selected.map(machine => [button(stateIcon(machine.state) + ' ' + label(machine.name), '/status ' + account.id + ' ' + machine.id)]);
+    const pages = [...(page > 1 ? [button('‹ 上一页', '/machines ' + account.id + ' ' + (page - 1))] : []), ...(machines.length > page * 8 ? [button('下一页 ›', '/machines ' + account.id + ' ' + (page + 1))] : [])];
+    if (pages.length) buttons.push(pages);
+    buttons.push([button('‹ 账号列表', '/accounts'), button('🔄 刷新列表', '/machines ' + account.id + ' ' + page)]);
+    return { html: true, text: '<b>🖥 ' + safeLabel(account.label) + '</b>\n共 ' + machines.length + ' 台机器 · 第 ' + page + ' 页\n\n' + (selected.length
+      ? selected.map(machine => stateIcon(machine.state) + ' <b>' + safeLabel(machine.name) + '</b>\n    ' + stateLabels[machine.state] + ' · ' + machine.spec.vcpus + ' vCPU / ' + machine.spec.memMiB / 1024 + ' GB').join('\n\n') + '\n\n点击机器按钮查看详情。'
+      : '没有更多机器。'), buttons };
   }
-  if (!/^[a-zA-Z0-9_-]{1,128}$/.test(args[1])) return '机器 ID 格式无效。';
+  if (!/^[a-zA-Z0-9_-]{1,128}$/.test(args[1])) return { text: '机器 ID 格式无效。', buttons: homeButtons() };
   const pending = await env.DB.prepare("SELECT * FROM insb_actions WHERE account_id=? AND machine_id=? AND state IN ('submitting','queued','running','unknown') ORDER BY created_at DESC LIMIT 1").bind(account.id, args[1]).first<ActionRow>();
   if (pending?.operation_id) await applyOperation(env.DB, pending, await remote.operation(pending.operation_id, 0));
   const machine = await remote.machine(args[1]);
-  if (name === '/status') return label(machine.name) + ' · ' + stateLabels[machine.state] + '\n服务：' + (machine.runtime.ready ? '已就绪' : '未就绪') + '\n/resume ' + account.id + ' ' + machine.id + '\n/suspend ' + account.id + ' ' + machine.id;
-  return submitAction(env, account, remote, machine, name === '/resume' ? 'resume' : 'suspend', requestId);
+  const buttons = machineButtons(account.id, machine.id);
+  if (name === '/status') {
+    if (!machine.operationId && machine.state === 'suspended') buttons[0].push(button('▶ 恢复机器', '/resume ' + account.id + ' ' + machine.id));
+    if (!machine.operationId && machine.state === 'running') buttons[0].push(button('⏸ 暂停机器', '/confirm-suspend ' + account.id + ' ' + machine.id));
+    return { html: true, text: '<b>' + stateIcon(machine.state) + ' ' + safeLabel(machine.name) + '</b>\n' + safeLabel(account.label) + '\n\n<b>状态</b>  ' + stateLabels[machine.state] + '\n<b>服务</b>  ' + (machine.runtime.ready ? '已就绪' : '未就绪') + '\n<b>配置</b>  ' + machine.spec.vcpus + ' vCPU / ' + machine.spec.memMiB / 1024 + ' GB\n<b>机器 ID</b>\n<code>' + html(machine.id) + '</code>\n\n' + (machine.state === 'stopped' ? '请先在面板启动机器。' : '点击下方按钮操作或刷新状态。'), buttons };
+  }
+  if (name === '/confirm-suspend') return { html: true, text: '<b>⏸ 暂停 ' + safeLabel(machine.name) + '？</b>\n\n暂停期间服务不可用，工作现场会保留。若已开启保活，时间窗口内可能自动恢复。', buttons: [[button('确认暂停', '/suspend ' + account.id + ' ' + machine.id), button('取消', '/status ' + account.id + ' ' + machine.id)]] };
+  return { text: await submitAction(env, account, remote, machine, name === '/resume' ? 'resume' : 'suspend', requestId), buttons };
 }
 export async function telegramWebhook(env: AutomationEnv, request: Request, fetcher?: Fetcher): Promise<Response> {
   const header = request.headers.get('X-Telegram-Bot-Api-Secret-Token') || '';
@@ -200,18 +251,31 @@ export async function telegramWebhook(env: AutomationEnv, request: Request, fetc
   const db = database(env), bot = await botRow(db);
   if (!bot || await digest(header) !== bot.webhook_hash) return new Response('Forbidden', { status: 403 });
   const update = await request.json().catch(() => null) as TelegramUpdate | null;
-  const message = update?.message;
+  const callback = update?.callback_query, message = callback ? callback.message : update?.message;
+  const sender = callback ? callback.from : message?.from;
   if (!update || !Number.isSafeInteger(update.update_id) || update.update_id < 0 || !message ||
-      message.chat?.type !== 'private' || String(message.chat.id) !== bot.chat_id || String(message.from?.id) !== bot.chat_id ||
-      message.from?.is_bot || typeof message.text !== 'string' || !message.text.startsWith('/') || message.text.length > 1000)
+      message.chat?.type !== 'private' || String(message.chat.id) !== bot.chat_id || String(sender?.id) !== bot.chat_id || sender?.is_bot ||
+      (callback ? typeof callback.id !== 'string' || callback.id.length > 200 || !Number.isSafeInteger(message.message_id) || message.message_id! <= 0
+        : typeof message.text !== 'string' || !message.text.startsWith('/') || message.text.length > 1000))
     return Response.json({ ok: true });
   await ensureDatabase(db);
+  const telegram = await botClient(env, bot, fetcher);
+  let selectedButton: ButtonRow | null = null;
+  if (callback) {
+    if (typeof callback.data === 'string' && /^ib:[a-f0-9]{32}$/.test(callback.data)) {
+      selectedButton = await db.prepare('SELECT command,request_id FROM insb_telegram_buttons WHERE token=? AND webhook_hash=? AND expires_at>?')
+        .bind(callback.data.slice(3), bot.webhook_hash, Date.now()).first<ButtonRow>();
+    }
+    try { await telegram.request('answerCallbackQuery', { callback_query_id: callback.id, ...(selectedButton ? {} : { text: '按钮已过期，请发送 /accounts 重新打开列表。', show_alert: true }) }); }
+    catch { /* An expired Telegram callback must not prevent a valid action or retry. */ }
+    if (!selectedButton) return Response.json({ ok: true });
+  }
   const timestamp = Date.now();
   let entry = await db.prepare('SELECT request_id,status FROM insb_telegram_updates WHERE update_id=?').bind(update.update_id).first<{ request_id: string; status: string }>();
   if (!entry) {
-    if (typeof message.date === 'number' && Math.abs(timestamp - message.date * 1000) > 300000) return Response.json({ ok: true });
+    if (!callback && typeof message.date === 'number' && Math.abs(timestamp - message.date * 1000) > 300000) return Response.json({ ok: true });
     await db.prepare('INSERT OR IGNORE INTO insb_telegram_updates (update_id,request_id,expires_at) VALUES (?,?,?)')
-      .bind(update.update_id, crypto.randomUUID(), timestamp + 7 * 86400000).run();
+      .bind(update.update_id, selectedButton?.request_id || crypto.randomUUID(), timestamp + 7 * 86400000).run();
     entry = await db.prepare('SELECT request_id,status FROM insb_telegram_updates WHERE update_id=?').bind(update.update_id).first<{ request_id: string; status: string }>();
   }
   if (!entry || entry.status === 'done') return Response.json({ ok: true });
@@ -219,12 +283,12 @@ export async function telegramWebhook(env: AutomationEnv, request: Request, fetc
     .bind(timestamp + 60000, update.update_id, timestamp).run();
   if (!claim.meta.changes) return new Response('Retry later', { status: 503 });
   try {
-    let reply: string;
-    try { reply = await command(env, bot, message.text, entry.request_id, fetcher); }
-    catch (error) { reply = error instanceof PanelError ? error.message : '请求暂时无法完成，请稍后重试。'; }
+    let reply: Reply;
+    try { reply = await command(env, bot, selectedButton?.command || message.text!, entry.request_id, fetcher); }
+    catch (error) { reply = { text: error instanceof PanelError ? error.message : '请求暂时无法完成，请稍后重试。', buttons: homeButtons() }; }
     const current = await botRow(db);
     if (current?.webhook_hash !== bot.webhook_hash) return Response.json({ ok: true });
-    await (await botClient(env, bot, fetcher)).send(bot.chat_id, reply);
+    await telegram.reply(db, bot, reply, callback ? message.message_id : undefined);
     await db.batch([db.prepare("UPDATE insb_telegram_updates SET status='done',lease_until=0 WHERE update_id=?").bind(update.update_id),
       db.prepare('DELETE FROM insb_telegram_updates WHERE expires_at<?').bind(timestamp)]);
     return Response.json({ ok: true });
@@ -260,13 +324,14 @@ export async function checkTelegramNotifications(env: AutomationEnv, dataKey: st
       await db.prepare('UPDATE insb_machine_watch SET account_id=? WHERE machine_id=?').bind(account.id, machine.id).run();
     let pendingText = previous.pending_text;
     if (['suspended', 'stopped', 'error', 'deleted'].includes(machine.state) && previous.state === 'running' && !pendingText) {
-      pendingText = '机器离线\n' + label(account.label) + ' / ' + label(machine.name) + '\n状态：' + (stateLabels[machine.state as keyof typeof stateLabels] || machine.state) + '\n/status ' + account.id + ' ' + machine.id;
+      pendingText = '🔔 机器离线\n' + label(account.label) + ' / ' + label(machine.name) + '\n状态：' + (stateLabels[machine.state as keyof typeof stateLabels] || machine.state);
       await db.prepare('UPDATE insb_machine_watch SET state=?,pending_text=? WHERE machine_id=?').bind(machine.state, pendingText, machine.id).run();
     }
     if (pendingText) {
       const current = await botRow(db);
       if (!current?.notify_offline || current.webhook_hash !== bot.webhook_hash) return;
-      await telegram.send(bot.chat_id, pendingText + (machine.state === 'running' ? '\n当前已恢复运行。' : ''));
+      const [heading, ...lines] = pendingText.replace(/\n\/status [^\n]+$/, '').split('\n');
+      await telegram.reply(db, bot, { html: true, text: '<b>' + html(heading) + '</b>\n\n' + html(lines.join('\n')) + (machine.state === 'running' ? '\n\n🟢 当前已恢复运行。' : '\n\n点击下方按钮查看最新状态。'), buttons: machineButtons(account.id, machine.id) });
       await db.prepare('UPDATE insb_machine_watch SET pending_text=NULL WHERE machine_id=?').bind(machine.id).run();
     }
     if (machine.state === 'running' && previous.state !== 'running')

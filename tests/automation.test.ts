@@ -35,6 +35,7 @@ async function fixture() {
   const calls: { path: string; method: string; key: string; idempotency: string | null }[] = [];
   const messages: string[] = [];
   const telegramCalls: string[] = [];
+  const telegramPayloads: { method: string; body: any }[] = [];
   const operations = new Map<string, any>();
   const control = { loseReply: false, failResume: false, failTelegram: false, failList: false, failMachine: '', webhookSecret: '', machineHook: undefined as (() => Promise<void>) | undefined };
   const fetcher: Fetcher = async (input, init = {}) => {
@@ -43,10 +44,11 @@ async function fixture() {
       assert.ok(url.pathname.startsWith('/bot' + botToken + '/'));
       const method = url.pathname.split('/').pop(), body = JSON.parse(String(init.body));
       telegramCalls.push(method!);
+      telegramPayloads.push({ method: method!, body });
       if (method === 'getMe') return Response.json({ ok: true, result: { id: 123456789, is_bot: true, username: 'fixture_bot' } });
       if (method === 'getChat') return Response.json({ ok: true, result: { id: Number(body.chat_id), type: 'private' } });
-      if (method === 'setWebhook') { assert.equal(body.url, base + '/api/telegram/webhook'); control.webhookSecret = body.secret_token; return Response.json({ ok: true, result: true }); }
-      if (method === 'sendMessage') {
+      if (method === 'setWebhook') { assert.equal(body.url, base + '/api/telegram/webhook'); assert.deepEqual(body.allowed_updates, ['message', 'callback_query']); control.webhookSecret = body.secret_token; return Response.json({ ok: true, result: true }); }
+      if (method === 'sendMessage' || method === 'editMessageText') {
         assert.equal(body.chat_id, chatId);
         if (control.failTelegram) { control.failTelegram = false; throw new Error('Telegram temporarily unavailable'); }
         messages.push(body.text);
@@ -101,7 +103,10 @@ async function fixture() {
   const webhook = (updateId: number, text: string, extra: Record<string, unknown> = {}, secret = control.webhookSecret) =>
     app.fetch(new Request(base + '/api/telegram/webhook', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Telegram-Bot-Api-Secret-Token': secret },
       body: JSON.stringify({ update_id: updateId, message: { date: Math.floor(Date.now() / 1000), chat: { id: Number(chatId), type: 'private' }, from: { id: Number(chatId) }, text, ...extra } }) }), env);
-  return { runtime, db, env, calls, messages, telegramCalls, operations, control, machines, fetcher, call, run, setPolicy, webhook };
+  const callback = (updateId: number, data: string, extra: Record<string, unknown> = {}, secret = control.webhookSecret) =>
+    app.fetch(new Request(base + '/api/telegram/webhook', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Telegram-Bot-Api-Secret-Token': secret },
+      body: JSON.stringify({ update_id: updateId, callback_query: { id: 'callback-' + updateId, data, from: { id: Number(chatId) }, message: { message_id: 100, date: Math.floor(Date.now() / 1000) - 3600, chat: { id: Number(chatId), type: 'private' }, from: { id: 123456789, is_bot: true } }, ...extra } }) }), env);
+  return { runtime, db, env, calls, messages, telegramCalls, telegramPayloads, operations, control, machines, fetcher, call, run, setPolicy, webhook, callback };
 }
 
 async function writeLegacyCredentials(db: D1Database) {
@@ -291,6 +296,74 @@ test('Telegram commands and offline notifications are private, authenticated and
       assert.equal((await webhook(12, '/accounts', {}, oldSecret)).status, 403);
     });
   } finally { await fixtureState.runtime.dispose(); }
+});
+
+test('Telegram inline buttons navigate, escape rich text and authorize durable callbacks', async context => {
+  const state = await fixture();
+  const { db, call, webhook, callback, machines, telegramPayloads, calls, operations, control, run } = state;
+  const lastReply = () => [...telegramPayloads].reverse().find(item => ['sendMessage', 'editMessageText'].includes(item.method))!;
+  const clickData = (name: string) => lastReply().body.reply_markup.inline_keyboard.flat().find((item: any) => item.text.includes(name)).callback_data as string;
+  let update = 1000;
+  try {
+    await call('/api/telegram', 'PUT', { botToken, chatId, notifyOffline: true });
+    const longId = 'm'.repeat(128);
+    machines.set(longId, { ...machine(longId), name: '<script> & 工作机' });
+    await db.prepare('UPDATE insb_accounts SET label=? WHERE id=?').bind('主账号 <lab> & dev', 'account-a').run();
+    await context.test('account and machine menus use HTML and short callback tokens even with long identifiers', async () => {
+      await webhook(update++, '/start');assert.equal(lastReply().body.parse_mode, 'HTML');
+      await callback(update++, clickData('查看账号'));
+      assert.equal(lastReply().method, 'editMessageText');assert.equal(lastReply().body.message_id, 100);
+      assert.ok(lastReply().body.text.includes('主账号 &lt;lab&gt; &amp; dev'));
+      await callback(update++, clickData('主账号'));
+      assert.ok(lastReply().body.text.includes('&lt;script&gt; &amp; 工作机'));assert.equal(lastReply().body.text.includes('/status '), false);
+      for (const item of lastReply().body.reply_markup.inline_keyboard.flat()) assert.ok(Buffer.byteLength(item.callback_data) <= 64);
+      await callback(update++, clickData('工作机'));
+      assert.ok(lastReply().body.text.includes('<code>' + longId + '</code>'));
+      assert.equal(operations.size, 0);
+    });
+    await context.test('foreign senders, groups, forged secrets and raw commands cannot execute callbacks', async () => {
+      const data = clickData('暂停机器'), before = calls.length, replies = telegramPayloads.length;
+      assert.equal((await callback(update++, data, {}, 'x'.repeat(43))).status, 403);
+      await callback(update++, data, { from: { id: 999 } });
+      await callback(update++, data, { from: { id: Number(chatId), is_bot: true } });
+      await callback(update++, data, { message: { message_id: 100, chat: { id: Number(chatId), type: 'group' } } });
+      await callback(update++, data, { message: { message_id: 100, chat: { id: 999, type: 'private' } } });
+      assert.equal(telegramPayloads.length, replies);assert.equal(calls.length, before);
+      await callback(update++, '/suspend account-a ' + longId);
+      assert.equal(telegramPayloads.at(-1)!.method, 'answerCallbackQuery');assert.equal(telegramPayloads.at(-1)!.body.show_alert, true);
+      assert.equal(calls.length, before);assert.equal(operations.size, 0);
+    });
+    await context.test('pause requires confirmation and repeated clicks or deliveries reuse the same action', async () => {
+      await callback(update++, clickData('暂停机器'));assert.equal(operations.size, 0);
+      const confirm = clickData('确认暂停'), id = update++;
+      assert.equal((await callback(id, confirm)).status, 200);assert.equal(operations.size, 1);
+      await callback(id, confirm);await callback(update++, confirm);
+      assert.equal(operations.size, 1);assert.equal((await call('/api/actions')).body.actions[0].source, 'telegram');
+      assert.ok(telegramPayloads.some(item => item.method === 'answerCallbackQuery'));
+      await callback(update++, clickData('查看状态'));
+      const resume = clickData('恢复机器');
+      control.loseReply = true;await callback(update++, resume);await callback(update++, resume);
+      assert.equal(operations.size, 2);
+    });
+    await context.test('pagination works in both directions and expired or rebound buttons are rejected', async () => {
+      for (let i = 6; i < 12; i++) machines.set('machine-' + i, machine('machine-' + i));
+      await webhook(update++, '/machines account-a');
+      await callback(update++, clickData('下一页'));assert.ok(lastReply().body.text.includes('第 2 页'));
+      await callback(update++, clickData('上一页'));assert.ok(lastReply().body.text.includes('第 1 页'));
+      const expired = clickData('刷新列表');
+      await db.prepare('UPDATE insb_telegram_buttons SET expires_at=0 WHERE token=?').bind(expired.slice(3)).run();
+      const before = calls.length;await callback(update++, expired);assert.equal(calls.length, before);assert.equal(telegramPayloads.at(-1)!.body.show_alert, true);
+      const rebound = clickData('账号列表');await call('/api/telegram', 'PUT', { botToken, chatId, notifyOffline: true });
+      await callback(update++, rebound);assert.equal(telegramPayloads.at(-1)!.body.show_alert, true);
+    });
+    await context.test('offline notifications include escaped rich text and a working status button', async () => {
+      machines.get(longId)!.state = 'running';machines.get(longId)!.operationId = null;
+      await run();machines.get(longId)!.state = 'suspended';await run();
+      assert.ok(lastReply().body.text.includes('机器离线'));assert.ok(lastReply().body.text.includes('&lt;script&gt;'));
+      assert.equal(lastReply().body.text.includes('/status '), false);
+      await callback(update++, clickData('查看状态'));assert.ok(lastReply().body.text.includes('<code>' + longId + '</code>'));
+    });
+  } finally { await state.runtime.dispose(); }
 });
 
 test('automation budgets and cross-channel races do not prevent keepalive or duplicate machine actions', async context => {

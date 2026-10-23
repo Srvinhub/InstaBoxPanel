@@ -34,7 +34,7 @@ export default function TelegramForm({ close }: { close: () => void }) {
     finally { setBusy(false); }
   }
   return <Modal title="Telegram 机器人" onClose={() => { if (!busy) close(); }}>
-    <p className="dialog-description">在私人聊天中查询账号、机器和状态，发送命令恢复或暂停机器。</p>
+    <p className="dialog-description">在私人聊天中点击按钮查看账号、机器和状态，恢复或暂停机器。</p>
     {isDemo && <div className="notice">演示模式只展示设置，不会连接机器人或发送消息。</div>}
     {error && <div className="notice error" role="alert">{error}</div>}
     {!status ? <p className="field-help">正在加载配置…</p> : <form className="account-form telegram-form" onSubmit={save}>
@@ -46,7 +46,7 @@ export default function TelegramForm({ close }: { close: () => void }) {
       <p className="field-help">每分钟检测已启用账号。首次检查建立基线；机器由运行变为暂停、停止或异常时通知，同一次离线不重复提醒。接口查询失败不会被当作机器离线。</p>
       {status.enabled && status.tokenRequired && <div className="notice">原机器人凭据无法读取，请重新填写原 Bot Token 后保存设置。无需在 CF 后台配置额外密钥。</div>}
       {status.lastError && <div className="notice error">最近通知检查：{status.lastError}</div>}
-      <div className="telegram-commands"><strong>常用命令</strong><code>/accounts</code><code>/machines 账号ID</code><code>/status 账号ID 机器ID</code><code>/resume 账号ID 机器ID</code><code>/suspend 账号ID 机器ID</code><code>/notifications on</code></div>
+      <div className="telegram-commands"><strong>从按钮开始</strong><span>发送 <code>/start</code> 或 <code>/accounts</code>，依次选择账号 → 机器 → 操作，无需输入长 ID。</span><span>暂停前需点击确认；离线通知可直接查看状态。</span><span>从旧版升级后，保存一次机器人设置即可启用按钮；再发送 <code>/accounts</code> 获取新列表。</span><details><summary>手动命令仍可使用</summary><code>/machines 账号ID</code><br/><code>/status 账号ID 机器ID</code><br/><code>/resume 账号ID 机器ID</code><br/><code>/suspend 账号ID 机器ID</code><br/><code>/notifications on</code></details></div>
       <div className="dialog-footer">{status.enabled && <button className="text-button danger-text" type="button" disabled={busy} onClick={() => setConfirm(true)}>解除绑定</button>}<button className="button primary" disabled={busy}>{busy ? <LoaderCircle size={16} className="spin"/> : <Send size={16}/>}{status.enabled ? '保存机器人设置' : '绑定机器人'}</button></div>
       {confirm && <div className="delete-confirm"><p>解除后将停止 Telegram 控制与通知，保活设置不受影响。</p><button type="button" className="button danger" disabled={busy} onClick={() => void disconnect()}>确认解除绑定</button><button type="button" className="button subtle" onClick={() => setConfirm(false)}>取消</button></div>}
     </form>}
