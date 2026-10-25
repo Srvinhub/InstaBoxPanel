@@ -297,3 +297,6 @@ wrangler.d1.jsonc 可选的手动 D1 迁移配置
 ~~~
 
 官方依据：[API keys and SDK](https://instabox.sh/docs/keys-sdk) · [OpenAPI](https://api.instabox.sh/v1/openapi.json) · [Workers WebSockets](https://developers.cloudflare.com/workers/runtime-apis/websockets/)。
+
+## 友链
+[LinuxDo](https://linux.do)
