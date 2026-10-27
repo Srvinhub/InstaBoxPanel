@@ -18,6 +18,11 @@ export const upstreamMessages: Record<string, string> = {
   payment_required: '需要处理 InstaBox 账号的付款或额度问题。',
   machine_not_running: '机器当前不在可执行此操作的状态。',
   rate_limited: 'InstaBox 请求频率受限，请稍后重试。',
+  desktop_not_running: '桌面尚未运行，请先启动桌面。',
+  delete_confirmation_required: '删除确认与快照不匹配，请重新确认。',
+  name_taken: '这个名称已被使用，请换一个名称。',
+  snapshot_not_ready: '快照尚未就绪，请等待保存完成。',
+  live_snapshot_disabled: '此机器不支持实时快照，请停止机器后创建。',
 };
 export function safeUpstreamMessage(code: string): string {
   return upstreamMessages[code] ?? 'InstaBox 未能完成请求，请稍后重试或到官方控制台查看。';

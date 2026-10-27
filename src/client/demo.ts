@@ -2,6 +2,7 @@ import type { Account, Action, Machine, ActionType } from '../shared/types';
 import { ApiError } from './api';
 import { validateSchedule, type KeepaliveOverview } from '../shared/keepalive';
 import type { TelegramStatus } from '../shared/telegram';
+import { demoResources } from './demo-resources';
 let telegram: TelegramStatus = { tokenRequired: true, enabled: false, username: '', chatId: '', notifyOffline: false, lastError: '' };
 const keepalive: KeepaliveOverview = { intervalMinutes: 1, maxMachines: 5, policies: [], lastRunAt: null };
 const stamp = () => new Date().toISOString();
@@ -44,6 +45,8 @@ export async function demoRequest(path: string, options: { method?: string; body
   }
   if (url.pathname === '/api/auth/logout' && method === 'POST') { authenticated = false; return { ok: true }; }
   if (!authenticated) throw new ApiError('authentication_required', '请先登录管理员账号。', 401);
+  const resource = demoResources(url.pathname,method,body,accounts,machines);
+  if(resource!==undefined)return resource;
   if (url.pathname === '/api/keepalive') return copy(keepalive);
   if (url.pathname === '/api/telegram') {
     if (method === 'PUT') telegram = { ...telegram, enabled: true, tokenRequired: false, username: 'instabox_demo_bot', chatId: body?.chatId || '', notifyOffline: Boolean(body?.notifyOffline) };

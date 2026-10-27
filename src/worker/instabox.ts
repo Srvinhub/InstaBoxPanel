@@ -36,6 +36,7 @@ export class Instabox {
     }
     if (response.status >= 300 && response.status < 400)
       throw new PanelError(502, 'upstream_redirect', 'InstaBox 返回了非预期跳转，已停止请求。');
+    if (response.status === 204) return null;
     let data: any;
     try { data = await response.json(); } catch { malformed(); }
     if (!response.ok) {

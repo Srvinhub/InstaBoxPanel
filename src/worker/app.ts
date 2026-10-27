@@ -10,6 +10,8 @@ import { applyOperation, createAction } from './actions';
 import { keepaliveOverview, saveKeepalive } from './keepalive';
 import { telegramStatus, saveTelegram, removeTelegram, telegramWebhook } from './telegram';
 import { authenticateSession, sessionStatus, setupAdmin, loginAdmin, logoutAdmin, type Identity } from './session';
+import { registerDesktopRoutes } from './desktop';
+import { registerSnapshotRoutes } from './snapshots';
 
 export interface Env { DB: D1Database; KEY_ENCRYPTION_SECRET?: string; AUTOMATION_SECRET?: string; ASSETS: FetcherBinding }
 interface FetcherBinding { fetch(request: Request): Promise<Response> }
@@ -148,7 +150,10 @@ export function createApp(deps: Dependencies = {}) {
     return c.json({ account: accountView(await account(c.env.DB, row.id, true)) });
   });
   app.delete('/api/accounts/:id', async c => {
+    await ensureDatabase(c.env.DB);
     const row = await account(c.env.DB, c.req.param('id'), true);
+    const snapshotPending = await c.env.DB.prepare("SELECT id FROM insb_snapshot_requests WHERE account_id=? AND state IN ('submitting','pending','unknown') LIMIT 1").bind(row.id).first();
+    if (snapshotPending) throw new PanelError(409,'pending_snapshots','请先在快照窗口确认未完成的快照请求，再移除账号。');
     const pending = await c.env.DB.prepare("SELECT id FROM insb_actions WHERE account_id = ? AND state IN ('submitting','queued','running','unknown') LIMIT 1").bind(row.id).first();
     if (pending) throw new PanelError(409, 'pending_actions', '请先等待或确认这个账号的未完成操作，再移除账号。');
     // Keep the audit trail, erase the credential, never call DELETE on InstaBox.
@@ -156,7 +161,8 @@ export function createApp(deps: Dependencies = {}) {
     const removed = await c.env.DB.batch([
       c.env.DB.prepare(`UPDATE insb_accounts SET deleted_at=?,updated_at=?,enabled=0,key_ciphertext='',key_iv='',key_suffix=''
         WHERE id=? AND deleted_at IS NULL AND NOT EXISTS
-        (SELECT id FROM insb_actions WHERE account_id=? AND state IN ('submitting','queued','running','unknown'))`).bind(now(), now(), row.id, row.id),
+        (SELECT id FROM insb_actions WHERE account_id=? AND state IN ('submitting','queued','running','unknown')) AND NOT EXISTS
+        (SELECT id FROM insb_snapshot_requests WHERE account_id=? AND state IN ('submitting','pending','unknown'))`).bind(now(), now(), row.id, row.id, row.id),
       c.env.DB.prepare(`UPDATE insb_keepalive SET mode='off',version=version+1,last_result='账号已移除',last_error=''
         WHERE account_id=? AND EXISTS(SELECT id FROM insb_accounts WHERE id=? AND deleted_at IS NOT NULL)`).bind(row.id, row.id),
       c.env.DB.prepare('DELETE FROM insb_machine_watch WHERE account_id=? AND EXISTS(SELECT id FROM insb_accounts WHERE id=? AND deleted_at IS NOT NULL)').bind(row.id, row.id),
@@ -270,6 +276,8 @@ export function createApp(deps: Dependencies = {}) {
     }
     return c.json({ action: actionView(await action(c.env.DB, record.id)) });
   });
+  registerDesktopRoutes(app,{account,remote:client,fetcher:deps.fetcher});
+  registerSnapshotRoutes(app,{account,remote:client,fetcher:deps.fetcher});
   app.all('/api/*', c => c.json({ error: { code: 'not_found', message: '接口不存在。' } }, 404));
   app.get('*', c => c.env.ASSETS.fetch(c.req.raw));
   app.onError((error, c) => {

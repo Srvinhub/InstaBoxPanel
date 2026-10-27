@@ -1,5 +1,5 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type FormEvent } from 'react';
-import { Activity, ArrowUpRight, Box, Check, ChevronRight, CircleAlert, Clock3, Ellipsis, HeartPulse, Layers3, LoaderCircle, LogOut, Pause, Play, Plus, RefreshCw, Search, Send, Server, ShieldCheck, Square, TerminalSquare, X } from 'lucide-react';
+import { lazy, Suspense, useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode, type FormEvent } from 'react';
+import { Activity, Archive, Monitor, ArrowUpRight, Box, Check, ChevronRight, CircleAlert, Clock3, Ellipsis, HeartPulse, Layers3, LoaderCircle, LogOut, Pause, Play, Plus, RefreshCw, Search, Send, Server, ShieldCheck, Square, TerminalSquare, X } from 'lucide-react';
 import { api, ApiError, concurrent, isDemo } from './api';
 import { actionLabels, actionSourceLabels, stateLabels, type Account, type AccountMachines, type Action, type ActionType, type Machine, type Session } from '../shared/types';
 import AuthScreen from './AuthScreen';
@@ -10,6 +10,8 @@ import { usePanelRoute } from './usePanelRoute';
 import { useTerminalWindows } from './useTerminalWindows';
 import TerminalDock from './TerminalDock';
 const TerminalPane = lazy(() => import('./TerminalPane'));
+const DesktopPane = lazy(() => import('./DesktopPane'));
+const SnapshotPane = lazy(() => import('./SnapshotPane'));
 
 interface Snapshot extends Partial<AccountMachines> { error?: string; failures?: number; retryAt?: number }
 export interface MachineRow { machine: Machine; account: Account; sources: Account[]; checkedAt: string; stale: boolean }
@@ -27,10 +29,11 @@ function merge(rows: Action[], next: Action) {
   return [next, ...rows.filter(a => a.id !== next.id)].sort((a,b) => b.createdAt.localeCompare(a.createdAt));
 }
 export function Modal({ title, children, onClose, wide = false }: { title: string; children: ReactNode; onClose: () => void; wide?: boolean }) {
+  const titleId=useId();
   const ref = useRef<HTMLDialogElement>(null);
   useEffect(() => { const el=ref.current; el?.showModal(); return () => el?.close(); }, []);
-  return <dialog ref={ref} className={'modal ' + (wide ? 'modal-wide' : '')} onCancel={e => { e.preventDefault(); onClose(); }}>
-    <div className="modal-heading"><h2>{title}</h2><button className="icon-button" aria-label="关闭" onClick={onClose}><X size={20}/></button></div>{children}
+  return <dialog ref={ref} aria-labelledby={titleId} className={'modal ' + (wide ? 'modal-wide' : '')} onCancel={e => { e.preventDefault(); onClose(); }}>
+    <div className="modal-heading"><h2 id={titleId}>{title}</h2><button className="icon-button" aria-label="关闭" onClick={onClose}><X size={20}/></button></div>{children}
   </dialog>;
 }
 function AccountForm({ current, close, saved }: { current: Account | null; close: () => void; saved: () => Promise<void> }) {
@@ -51,7 +54,7 @@ function AccountForm({ current, close, saved }: { current: Account | null; close
     <form onSubmit={save} className="account-form">
       <label>账号别名<input autoFocus value={label} maxLength={60} required placeholder="例如：主账号、实验室" onChange={e=>setLabel(e.target.value)} disabled={busy}/></label>
       <label>{current?'替换 API Key':'API Key'}<input type="password" autoComplete="new-password" spellCheck={false} value={key} required={!current} placeholder={current?'留空保留现有 Key':'ibk_…'} onChange={e=>setKey(e.target.value)} disabled={busy}/></label>
-      <p className="field-help">在 InstaBox 的 Profile → API keys 创建专用 Key，授予 <code>machines:write</code> 权限。保存后不再展示完整凭据。</p>
+      <p className="field-help">在 InstaBox 的 Profile → API keys 创建专用 Key，授予 <code>machines:write</code> 权限。快照另需 <code>images:read</code>、<code>images:write</code> 和 <code>images:delete</code>。保存后不再展示完整凭据。</p>
       {current&&<label className="checkbox-label"><input type="checkbox" checked={enabled} onChange={e=>setEnabled(e.target.checked)} disabled={busy}/>启用账号同步与机器控制</label>}
       {error&&<div className="notice error" role="alert">{error}</div>}
       {remove&&<div className="delete-confirm"><p>移除“{current?.label}”及其连接凭据？InstaBox 上的机器会继续保留。</p><button type="button" className="button danger" disabled={busy} onClick={erase}>确认移除</button><button type="button" className="button subtle" onClick={()=>setRemove(false)}>取消</button></div>}
@@ -79,6 +82,11 @@ function Dashboard({session,signedOut}:{session:Session;signedOut:()=>void}){
   const setHistory=(open:boolean)=>navigate({view:open?'history':'machines',selected},!open);
   const setTelegramOpen=(open:boolean)=>navigate({view:open?'telegram':'machines',selected},!open);
   const terminalWindows=useTerminalWindows();
+  const desktopWindows=useTerminalWindows();
+  const [activeSurface,setActiveSurface]=useState<'terminal'|'desktop'>('terminal');
+  const remoteSlots=useRef(new Set<string>());
+  remoteSlots.current=new Set([...terminalWindows.windows.map(item=>'terminal:'+item.row.machine.id),...desktopWindows.windows.map(item=>'desktop:'+item.row.machine.id)]);
+  const [snapshotTarget,setSnapshotTarget]=useState<{account:Account;row?:MachineRow}|null>(null);
   const [fatal,setFatal]=useState('');
   const [accounts,setAccounts]=useState<Account[]>([]),[snapshots,setSnapshots]=useState<Record<string,Snapshot>>({}),[actions,setActions]=useState<Action[]>([]);
   const accountsRef=useRef(accounts);accountsRef.current=accounts;
@@ -208,11 +216,18 @@ function Dashboard({session,signedOut}:{session:Session;signedOut:()=>void}){
       checkedAt:snapshot?.checkedAt||row.checkedAt,stale:!account||Boolean(snapshot?.error)||Date.now()-Date.parse(snapshot?.checkedAt||'')>30000};
   };
   function openTerminal(row:MachineRow){
-    if(!terminalWindows.windows.some(item=>item.row.machine.id===row.machine.id)&&terminalWindows.windows.length>=8){notify('最多同时保留 8 个终端，请先在右下角断开一个连接。',true);return;}
+    const key='terminal:'+row.machine.id;
+    if(!remoteSlots.current.has(key)&&remoteSlots.current.size>=8){notify('终端和远程桌面合计最多保留 8 个窗口，请先断开一个连接。',true);return;}
+    remoteSlots.current.add(key);setActiveSurface('terminal');
     terminalWindows.open(row);
   }
+  function openDesktop(row:MachineRow){
+    const key='desktop:'+row.machine.id;
+    if(!remoteSlots.current.has(key)&&remoteSlots.current.size>=8){notify('终端和远程桌面合计最多保留 8 个窗口，请先断开一个连接。',true);return;}
+    remoteSlots.current.add(key);setActiveSurface('desktop');desktopWindows.open(row);
+  }
   async function logout(){
-    try{await api('/api/auth/logout',{method:'POST',body:{}});signedOut();}catch(error){authError(error);notify(message(error),true);}
+    try{await Promise.allSettled(desktopWindows.windows.map(({row})=>api('/api/accounts/'+row.account.id+'/machines/'+row.machine.id+'/desktop',{method:'POST',body:{action:'handback'},signal:AbortSignal.timeout(3000)})));await api('/api/auth/logout',{method:'POST',body:{}});signedOut();}catch(error){authError(error);notify(message(error),true);}
   }
   if(fatal)return <main className="access-screen"><span className="brand-mark"><Box/></span><h1>连接私人控制台</h1><p role="alert">{fatal}</p><button className="button primary" onClick={()=>location.reload()}><RefreshCw size={16}/>重试连接</button></main>;
   return <div className="app-shell">
@@ -235,6 +250,7 @@ function Dashboard({session,signedOut}:{session:Session;signedOut:()=>void}){
       <div className="stats"><div className="stat"><span className="stat-icon"><Server size={20}/></span><div><span className="stat-label">全部机器</span><strong>{rows.length}<small>台</small></strong></div><span className="stat-note">{accounts.filter(a=>a.enabled).length} 个账号已启用</span></div><div className="stat"><span className="stat-icon running"><Activity size={20}/></span><div><span className="stat-label">运行中</span><strong>{rows.filter(r=>!r.stale&&r.machine.state==='running').length}<small>台</small></strong></div><span className="stat-note">当前正在运行</span></div><div className="stat"><span className="stat-icon paused"><Pause size={20}/></span><div><span className="stat-label">已暂停</span><strong>{rows.filter(r=>!r.stale&&r.machine.state==='suspended').length}<small>台</small></strong></div><span className="stat-note">随时继续工作</span></div></div>
       {errors.map(a=><div className="notice error account-error" role="alert" key={a.id}><CircleAlert size={17}/><div><strong>{a.label} 暂时无法同步</strong><span>{snapshots[a.id].error} {snapshots[a.id].checkedAt?'上次成功查询：'+ago(snapshots[a.id].checkedAt)+'。':''}</span></div><button className="text-button" onClick={()=>setForm(a)}>管理账号</button></div>)}
       {progressError&&<div className="notice error" role="status">{progressError}</div>}
+      {!!accounts.length&&<div className="resource-shortcuts"><span>快照库</span>{accounts.filter(a=>selected==='all'||a.id===selected).map(a=><button key={a.id} className="button compact" disabled={!a.enabled} onClick={()=>setSnapshotTarget({account:a})}><Archive size={14}/>{a.label} · 账号快照</button>)}</div>}
       <section className="machine-panel" aria-label="机器列表">
         <div className="panel-top"><div><h2>机器列表 <span>{shown.length}</span></h2><p>暂停保留工作现场，恢复后继续。</p></div><div className="refresh-area"><span className="sync-label"><span className={'connection-dot '+(visible?'good':'disabled')}/>{visible?'每 10 秒刷新':'后台刷新已暂停'}</span><button className="icon-button refresh-button" aria-label="刷新机器" disabled={refreshing} onClick={()=>void refresh(true)}><RefreshCw size={17} className={refreshing?'spin':''}/></button></div></div>
         <div className="toolbar"><div className="filter-tabs" aria-label="按状态筛选">{[['all','全部'],['running','运行中'],['suspended','已暂停'],['stopped','已停止']].map(([v,t])=><button key={v} className={filter===v?'active':''} aria-pressed={filter===v} onClick={()=>setFilter(v)}>{t}</button>)}</div><label className="search-box"><Search size={16}/><input aria-label="搜索机器" placeholder="搜索机器名称或 ID…" value={search} onChange={e=>setSearch(e.target.value)}/></label></div>
@@ -244,7 +260,7 @@ function Dashboard({session,signedOut}:{session:Session;signedOut:()=>void}){
           <td><span className="account-pill">{r.account.label}</span>{r.sources.length>1&&<small className="source-count">另外 {r.sources.length-1} 个账号可访问</small>}</td>
           <td><span className={'state-badge '+(r.stale?'unknown':r.machine.state)}><span/>{r.stale?'数据已过期':stateLabels[r.machine.state]}</span>{r.stale?<small className="state-detail">上次：{stateLabels[r.machine.state]}</small>:r.machine.state==='running'&&!r.machine.runtime.ready?<small className="state-detail">等待服务就绪</small>:null}</td>
           <td className="last-checked"><Clock3 size={13}/>{ago(r.checkedAt)}</td>
-          <td className="actions-cell"><div className="row-actions">{control(r)}<button className="icon-button" aria-label={'打开 '+r.machine.name+' 终端'} disabled={r.stale} onClick={()=>openTerminal(r)}><TerminalSquare size={17}/></button><button className={'icon-button keepalive-button'+(keepalive.policies.some(policy=>policy.machineId===r.machine.id&&policy.mode!=='off')?' enabled':'')} aria-label={'设置 '+r.machine.name+' 保活'} title="设置保活" onClick={()=>setKeepaliveRow(r)}><HeartPulse size={17}/></button><button className="icon-button" aria-label={'查看 '+r.machine.name+' 详情'} onClick={()=>setDetail(r)}><Ellipsis size={18}/></button></div></td>
+          <td className="actions-cell"><div className="row-actions">{control(r)}<button className="icon-button" aria-label={'打开 '+r.machine.name+' 终端'} disabled={r.stale} onClick={()=>openTerminal(r)}><TerminalSquare size={17}/></button><button className="icon-button" title="远程桌面" aria-label={'打开 '+r.machine.name+' 远程桌面'} disabled={r.stale} onClick={()=>openDesktop(r)}><Monitor size={17}/></button><button className="icon-button" title="快照" aria-label={'查看 '+r.machine.name+' 快照'} onClick={()=>setSnapshotTarget({account:r.account,row:r})}><Archive size={17}/></button><button className={'icon-button keepalive-button'+(keepalive.policies.some(policy=>policy.machineId===r.machine.id&&policy.mode!=='off')?' enabled':'')} aria-label={'设置 '+r.machine.name+' 保活'} title="设置保活" onClick={()=>setKeepaliveRow(r)}><HeartPulse size={17}/></button><button className="icon-button" aria-label={'查看 '+r.machine.name+' 详情'} onClick={()=>setDetail(r)}><Ellipsis size={18}/></button></div></td>
         </tr>)}</tbody></table></div>}
         <footer className="panel-footer"><span><ShieldCheck size={14}/>状态查询不会唤醒机器，也不会重置空闲计时。</span><span>{refreshing?'正在同步…':errors.length?'部分账号未同步':'按账号独立同步'}</span></footer>
       </section>
@@ -252,17 +268,20 @@ function Dashboard({session,signedOut}:{session:Session;signedOut:()=>void}){
     </div><footer className="site-footer"><span>© {new Date().getFullYear()} <a href="https://github.com/meicuode/InstaBoxPanel" target="_blank" rel="noopener noreferrer">InstaBoxPanel</a></span><span aria-hidden="true">·</span><a href="https://cfnote.zuichu.de/blog?tag=InstaBox" target="_blank" rel="noopener noreferrer">使用指南</a></footer></main>
     {toast&&<div className={'toast '+(toast.error?'toast-error':'')} role={toast.error?'alert':'status'}>{toast.error?<CircleAlert size={18}/>:<Check size={18}/>}<span>{toast.text}</span><button className="icon-button" aria-label="关闭提示" onClick={()=>setToast(null)}><X size={16}/></button></div>}
     {form&&<AccountForm current={form==='new'?null:form} close={()=>setForm(null)} saved={reloadAccounts}/>}
-    {detail&&<Details row={latest(detail)} control={control(latest(detail))} close={()=>setDetail(null)} stop={()=>void change(latest(detail),'stop')} busy={submitting.has(detail.machine.id)||busyMap.has(detail.machine.id)} terminal={()=>{openTerminal(latest(detail));setDetail(null);}}/>}
+    {detail&&<Details row={latest(detail)} control={control(latest(detail))} close={()=>setDetail(null)} stop={()=>void change(latest(detail),'stop')} busy={submitting.has(detail.machine.id)||busyMap.has(detail.machine.id)} terminal={()=>{openTerminal(latest(detail));setDetail(null);}} desktop={()=>{openDesktop(latest(detail));setDetail(null);}} snapshots={()=>{const row=latest(detail);setSnapshotTarget({account:row.account,row});setDetail(null);}}/>}
+    {snapshotTarget&&<Suspense fallback={<div className="toast">正在加载快照…</div>}><SnapshotPane key={snapshotTarget.account.id+':'+(snapshotTarget.row?.machine.id||'all')} account={accounts.find(a=>a.id===snapshotTarget.account.id)||{...snapshotTarget.account,enabled:false}} row={snapshotTarget.row?latest(snapshotTarget.row):undefined} onClose={()=>setSnapshotTarget(null)}/></Suspense>}
     {keepaliveRow&&<KeepaliveForm row={latest(keepaliveRow)} overview={keepalive} close={()=>setKeepaliveRow(null)} saved={value=>{setKeepalive(value);notify('保活设置已保存。');}}/>}
     {telegramOpen&&<TelegramForm close={()=>setTelegramOpen(false)}/>}
-    {terminalWindows.windows.map(({row:terminal,minimized},index)=><Suspense key={terminal.machine.id} fallback={<div className="toast" role="status">正在加载终端…</div>}><TerminalPane row={latest(terminal)} control={control(latest(terminal))} index={index} active={terminalWindows.activeId===terminal.machine.id} minimized={minimized} onActivate={()=>terminalWindows.activate(terminal.machine.id)} onMinimize={()=>terminalWindows.hide(terminal.machine.id,false)} onClose={()=>terminalWindows.hide(terminal.machine.id,true)}/></Suspense>)}
-    <TerminalDock windows={terminalWindows.windows.filter(item=>item.minimized)} restore={terminalWindows.restore} close={terminalWindows.close}/>
+    {terminalWindows.windows.map(({row:terminal,minimized},index)=><Suspense key={terminal.machine.id} fallback={<div className="toast" role="status">正在加载终端…</div>}><TerminalPane row={latest(terminal)} control={control(latest(terminal))} index={index} active={activeSurface==='terminal'&&terminalWindows.activeId===terminal.machine.id} minimized={minimized} onActivate={()=>{setActiveSurface('terminal');terminalWindows.activate(terminal.machine.id);}} onMinimize={()=>terminalWindows.hide(terminal.machine.id,false)} onClose={()=>terminalWindows.hide(terminal.machine.id,true)}/></Suspense>)}
+    <TerminalDock windows={terminalWindows.windows.filter(item=>item.minimized)} restore={id=>{setActiveSurface('terminal');terminalWindows.restore(id);}} close={terminalWindows.close}/>
+    {desktopWindows.windows.map(({row,minimized},index)=><Suspense key={row.machine.id} fallback={<div className="toast">正在加载桌面…</div>}><DesktopPane row={latest(row)} index={index} active={activeSurface==='desktop'&&desktopWindows.activeId===row.machine.id} minimized={minimized} onActivate={()=>{setActiveSurface('desktop');desktopWindows.activate(row.machine.id);}} onMinimize={()=>desktopWindows.hide(row.machine.id,false)} onClose={()=>desktopWindows.close(row.machine.id)}/></Suspense>)}
+    {!!desktopWindows.windows.some(item=>item.minimized)&&<aside className="desktop-dock" aria-label="收起的远程桌面">{desktopWindows.windows.filter(item=>item.minimized).map(({row})=><div key={row.machine.id}><button aria-label={'恢复 '+row.machine.name+' 远程桌面'} onClick={()=>{setActiveSurface('desktop');desktopWindows.restore(row.machine.id);}}><Monitor size={16}/>{row.machine.name}</button><button aria-label={'断开 '+row.machine.name+' 远程桌面'} onClick={()=>desktopWindows.close(row.machine.id)}><X size={15}/></button></div>)}</aside>}
     {history&&<Modal title="操作记录" onClose={()=>setHistory(false)} wide><p className="dialog-description">跟踪 Web、TG 和保活定时器的操作；刷新页面后仍可继续查看。</p>{!actions.length?<div className="empty"><Activity size={30}/><h3>还没有操作记录</h3></div>:<div className="history-list">{actions.map(a=><div className="history-row" key={a.id}><span className={'history-icon '+a.state}>{pending(a)?<LoaderCircle size={18} className="spin"/>:a.state==='succeeded'?<Check size={18}/>:<CircleAlert size={18}/>}</span><div className="history-body"><strong>{actionLabels[a.type]} · {a.machineName}</strong><small>{accounts.find(x=>x.id===a.accountId)?.label||'已移除账号'} · {new Date(a.createdAt).toLocaleString('zh-CN')}</small><p className="history-origin">操作备注：{actionSourceLabels[a.source||'unknown']}</p>{a.errorMessage&&<p className="history-error">{a.errorMessage}</p>}{a.type==='resume'&&a.processesPreserved===false&&<p className="history-error">机器已重新启动，原来的进程未保留。</p>}</div><div className="history-result"><span>{{submitting:'提交中',queued:'排队中',running:'执行中',succeeded:'已完成',failed:'失败',unknown:'结果待确认'}[a.state]}</span>{a.state==='unknown'&&<button className="button compact" disabled={submitting.has(a.machineId)} onClick={()=>retry(a)}>重试原请求</button>}</div></div>)}</div>}</Modal>}
   </div>;
 }
-function Details({row,control,close,stop,busy,terminal}:{row:MachineRow;control:ReactNode;close:()=>void;stop:()=>void;busy:boolean;terminal:()=>void}){
+function Details({row,control,close,stop,busy,terminal,desktop,snapshots}:{row:MachineRow;control:ReactNode;close:()=>void;stop:()=>void;busy:boolean;terminal:()=>void;desktop:()=>void;snapshots:()=>void}){
   const [confirm,setConfirm]=useState(false);const m=row.machine;
-  return <Modal title={m.name} onClose={close}><div className="detail-status"><span className={'state-badge '+(row.stale?'unknown':m.state)}><span/>{row.stale?'数据已过期':stateLabels[m.state]}</span><div className="row-actions">{control}<button className="button compact" disabled={row.stale} onClick={terminal}><TerminalSquare size={14}/>终端</button></div></div>
+  return <Modal title={m.name} onClose={close}><div className="detail-status"><span className={'state-badge '+(row.stale?'unknown':m.state)}><span/>{row.stale?'数据已过期':stateLabels[m.state]}</span><div className="row-actions">{control}<button className="button compact" disabled={row.stale} onClick={terminal}><TerminalSquare size={14}/>终端</button><button className="button compact" disabled={row.stale} onClick={desktop}><Monitor size={14}/>桌面</button><button className="button compact" onClick={snapshots}><Archive size={14}/>快照</button></div></div>
     <dl className="details">{[['机器 ID',m.id],['可访问账号',row.sources.map(a=>a.label).join('、')],['组织 ID',m.orgId||'—'],['配置',m.spec.vcpus+' vCPU / '+m.spec.memMiB/1024+' GB'],['空闲自动暂停',m.autoSuspendAfterSeconds===null?'已关闭':m.autoSuspendAfterSeconds/60+' 分钟'],['服务就绪',m.runtime.ready?'已就绪':'尚未就绪'],['最近查询',row.checkedAt?new Date(row.checkedAt).toLocaleString('zh-CN'):'—']].map(([k,v])=><div key={k}><dt>{k}</dt><dd>{v}</dd></div>)}</dl>
     {m.state==='running'&&<div className="stop-section"><h3><Square size={15}/>停止机器</h3><p>停止会结束当前进程，保留文件。下次启动会重新开机。</p>{confirm?<div className="stop-confirm"><span>确认结束这台机器上的所有进程？</span><button className="button danger" disabled={busy||row.stale} onClick={()=>{setConfirm(false);stop();}}>确认停止</button><button className="button subtle" onClick={()=>setConfirm(false)}>取消</button></div>:<button className="button" disabled={busy||row.stale} onClick={()=>setConfirm(true)}>停止机器…</button>}</div>}
   </Modal>;

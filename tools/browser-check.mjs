@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process';
 import { access, mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { checkTerminalConnections } from './terminal-browser-check.mjs';
+import { checkResourceViews, checkDesktopProtocol } from './resources-browser-check.mjs';
 const root=process.cwd(),base='http://127.0.0.1:4177',output=path.join(root,'test-results');
 await mkdir(output,{recursive:true});
 let executablePath;
@@ -27,6 +28,7 @@ try{
   await page.screenshot({path:path.join(output,'login-desktop.png')});await page.getByLabel('密码',{exact:true}).fill('browser-demo-password');await page.getByRole('button',{name:'登录',exact:true}).click();await page.locator('[data-machine="development"]').waitFor();step('logout, rejected password, and successful admin login');
   assert.equal(await page.locator('.machines tbody tr').count(),5);assert.ok((await page.locator('.demo-banner').innerText()).includes('演示模式'));
   step('dashboard loads five machines');await page.screenshot({path:path.join(output,'dashboard-desktop.png'),fullPage:true});
+  await checkResourceViews(page,output);step('desktop control, handback, resize, minimize, snapshots create/list/delete, and mobile desktop');
   await page.getByRole('button',{name:'已暂停',exact:true}).click();assert.equal(await page.locator('.machines tbody tr').count(),2);
   await page.getByRole('button',{name:'全部',exact:true}).click();await page.getByRole('textbox',{name:'搜索机器'}).fill('development');assert.equal(await page.locator('.machines tbody tr').count(),1);
   await page.getByRole('textbox',{name:'搜索机器'}).fill('no-such-machine');await page.getByRole('heading',{name:'没有匹配的机器'}).waitFor();await page.getByRole('textbox',{name:'搜索机器'}).fill('');
@@ -137,6 +139,7 @@ try{
   await page.screenshot({path:path.join(output,'terminal-mobile.png')});step('mobile selection, dashboard layout, and terminal');
   await page.getByRole('button',{name:'退出登录',exact:true}).filter({visible:true}).click();await page.getByRole('heading',{name:'登录私人控制台',exact:true}).waitFor();assert.equal(await page.locator('.floating-terminal').count(),0);assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));await page.screenshot({path:path.join(output,'login-mobile.png')});step('mobile logout closes terminals and preserves login layout');
   await checkTerminalConnections(browser,root,output);step('WebSocket survives minimization and restore; 60-second timeout, immediate close, and logout disconnect');
+  await checkDesktopProtocol(browser,root,output);step('real noVNC RFB handshake/framebuffer/input, read-only handback, stale status and disconnect');
   assert.deepEqual(failures,[],'browser errors');await writeFile(path.join(output,'browser-report.json'),JSON.stringify({passed:steps,errors:failures},null,2)+'\n');console.log('Browser checks passed: '+steps.length);
 }catch(error){if(browser){const page=browser.contexts()[0]?.pages()[0];if(page)await page.screenshot({path:path.join(output,'failure.png'),fullPage:true}).catch(()=>{});}console.error(error);process.exitCode=1;}
 finally{await browser?.close();child.kill();}
