@@ -12,6 +12,7 @@ import { telegramStatus, saveTelegram, removeTelegram, telegramWebhook } from '.
 import { authenticateSession, sessionStatus, setupAdmin, loginAdmin, logoutAdmin, type Identity } from './session';
 import { registerDesktopRoutes } from './desktop';
 import { registerSnapshotRoutes } from './snapshots';
+import { registerPortRoutes } from './ports';
 
 export interface Env { DB: D1Database; KEY_ENCRYPTION_SECRET?: string; AUTOMATION_SECRET?: string; ASSETS: FetcherBinding }
 interface FetcherBinding { fetch(request: Request): Promise<Response> }
@@ -278,6 +279,7 @@ export function createApp(deps: Dependencies = {}) {
   });
   registerDesktopRoutes(app,{account,remote:client,fetcher:deps.fetcher});
   registerSnapshotRoutes(app,{account,remote:client,fetcher:deps.fetcher});
+  registerPortRoutes(app,{account,remote:client});
   app.all('/api/*', c => c.json({ error: { code: 'not_found', message: '接口不存在。' } }, 404));
   app.get('*', c => c.env.ASSETS.fetch(c.req.raw));
   app.onError((error, c) => {
